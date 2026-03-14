@@ -22,7 +22,7 @@ Sistema de Gestão de Pecuária focado em **Movimentação e Estoque de Gado (ME
 ## 📦 Como Instalar e Rodar
 
 1. **Clone o repositório:**
-   git clone [https://github.com/SEU_USUARIO/ajagro-app.git](https://github.com/SEU_USUARIO/ajagro-app.git)
+   git clone [https://github.com/https://github.com/murilocaio75/ajagro-app.git](https://github.com/murilocaio75/ajagro-app.git)
 
    Crie um ambiente virtual (opcional, mas recomendado):
    python -m venv venv
