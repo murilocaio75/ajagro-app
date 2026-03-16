@@ -2,6 +2,8 @@
 
 Sistema de Gestão de Pecuária focado em **Movimentação e Estoque de Gado (MEG)**. Este software foi desenvolvido para substituir planilhas manuais por uma interface dinâmica, permitindo o controle patrimonial em tempo real da propridade rural.
 
+Status: Versão 2.0 (Em Nuvem) - Banco de dados migrado para Supabase e sistema de autenticação implementado.
+
 ## 🚀 Funcionalidades
 
 - **Cadastros Base:** Gestão de Fazendas e Lotes.
