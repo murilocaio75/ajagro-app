@@ -141,11 +141,12 @@ if login():
             st.error("Nenhum Lote ou Fazenda encontrado.")
         conn.close()
 
-    # --- PÁGINA: DASHBOARD --- 
+# --- PÁGINA: DASHBOARD --- 
     elif menu == "Dashboard & Valorização":
         st.header("📊 Painel Resumo & Valorização Patrimonial")
         conn = get_connection()
 
+        # Configuração da Barra Lateral para o Dashboard
         st.sidebar.divider()
         st.sidebar.subheader("Período de Análise")
         hoje = date.today()
@@ -153,6 +154,7 @@ if login():
         data_inicio = st.sidebar.date_input("Data Inicial", primeiro_dia)
         data_fim = st.sidebar.date_input("Data Final", hoje)
 
+        # 1. Query do Estado Atual (Filtrada pelo período lateral)
         query_filtrada = text("""
             SELECT 
                 categoria as "categoria",
@@ -165,6 +167,7 @@ if login():
         
         df_estoque = pd.read_sql(query_filtrada, conn, params={"inicio": data_inicio, "fim": data_fim})
         
+        # Bloco Principal: Se houver dados no período selecionado
         if not df_estoque.empty:
             df_estoque['saldo_qtd'] = pd.to_numeric(df_estoque['saldo_qtd'], errors='coerce').fillna(0)
             df_estoque['Preço Unit.'] = df_estoque['categoria'].map(CATEGORIAS_PRECOS).fillna(0)
@@ -176,6 +179,7 @@ if login():
             df_grafico = df_estoque[df_estoque['Total R$'] > 0]
             total_cabecas = df_estoque['saldo_qtd'].sum()
         
+            # Métricas em destaque
             c1, c2, c3 = st.columns(3)
             c1.metric("Estoque Total", f"{total_cabecas} cab.")
             c2.metric("Valorização Total", f"R$ {total_patrimonial:,.2f}")
@@ -199,14 +203,53 @@ if login():
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df_estoque.to_excel(writer, index=False, sheet_name='Balanco_AJAGRO')
                 st.download_button(label="📥 Baixar Balanço (Excel)", data=buffer.getvalue(), file_name=f"balanco_ajagro_{data_inicio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        else:
-            st.info("Nenhum movimento encontrado no período selecionado.")
+            
+            # --- SEÇÃO: GRÁFICO DE HISTÓRICO (Ignora o filtro lateral para ver 2023) ---
+            st.divider()
+            st.subheader("📈 Evolução Patrimonial Mensal (Histórico Total)")
 
+            query_historico = text("""
+                SELECT 
+                    DATE_TRUNC('month', data_movimento) as mes,
+                    SUM(CASE WHEN tipo_movimento IN ('Entrada (Compra)', 'Nascimento', 'Transferência') THEN quantidade ELSE 0 END) -
+                    SUM(CASE WHEN tipo_movimento IN ('Morte', 'Venda') THEN quantidade ELSE 0 END) as saldo_mensal
+                FROM lanc_estoque
+                GROUP BY mes
+                ORDER BY mes
+            """)
+            
+            df_hist_bruto = pd.read_sql(query_historico, conn)
+            
+            if not df_hist_bruto.empty:
+                df_hist_bruto['saldo_acumulado'] = df_hist_bruto['saldo_mensal'].cumsum()
+                # Usamos a média de preços atual para valorizar o passado
+                preco_medio_geral = df_estoque['Preço Unit.'].mean() if not df_estoque.empty else 0
+                df_hist_bruto['Valor Estimado (R$)'] = df_hist_bruto['saldo_acumulado'] * preco_medio_geral
+
+                fig_linha = px.line(
+                    df_hist_bruto, 
+                    x='mes', 
+                    y='Valor Estimado (R$)',
+                    markers=True,
+                    labels={'mes': 'Mês de Referência', 'Valor Estimado (R$)': 'Patrimônio Total'},
+                    color_discrete_sequence=['#2E7D32']
+                )
+                fig_linha.update_layout(hovermode="x unified")
+                st.plotly_chart(fig_linha, use_container_width=True)
+            else:
+                st.info("Aguardando mais dados mensais para gerar o gráfico de linha.")
+
+        else:
+            st.info("Nenhum movimento encontrado no período selecionado na barra lateral.")
+
+        # --- SEÇÃO: LISTAGEM DE LANÇAMENTOS (Final da página) ---
         st.divider()
         st.subheader("📑 Últimos 20 Lançamentos")
-        query_hist = text("SELECT TO_CHAR(data_movimento, 'DD/MM/YYYY') as Data, tipo_movimento as Operação, categoria as Classe, quantidade as Qtd FROM lanc_estoque ORDER BY id_lancamento DESC LIMIT 20")
-        df_hist = pd.read_sql(query_hist, conn)
-        st.dataframe(df_hist, use_container_width=True, hide_index=True)
+        query_recentes = text("SELECT TO_CHAR(data_movimento, 'DD/MM/YYYY') as Data, tipo_movimento as Operação, categoria as Classe, quantidade as Qtd FROM lanc_estoque ORDER BY id_lancamento DESC LIMIT 20")
+        df_hist_lista = pd.read_sql(query_recentes, conn)
+        st.dataframe(df_hist_lista, use_container_width=True, hide_index=True)
+        
+        # Fecha a conexão após realizar todas as consultas da página
         conn.close()
 
     # --- PÁGINA: AJUSTE DE PREÇOS ---
