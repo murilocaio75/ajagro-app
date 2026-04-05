@@ -35,9 +35,11 @@ def get_saldo_atual(conn, fazenda_id, categoria):
     return res if res else 0
 
 def is_mes_fechado(conn, data_mov):
-    prim_dia = data_mov.replace(day=1)
-    res = conn.execute(text("SELECT status FROM fechamentos_mensais WHERE ano_mes = :d"), {"d": prim_dia}).scalar()
-    return res == 'Fechado'
+    # Força a data para o primeiro dia do mês para garantir a paridade com o banco
+    primeiro_dia_mes = date(data_mov.year, data_mov.month, 1)
+    query = text("SELECT status FROM fechamentos_mensais WHERE ano_mes = :d")
+    res = conn.execute(query, {"d": primeiro_dia_mes}).fetchone()
+    return res is not None and res[0] == 'Fechado'
 
 # --- LOGIN ---
 if "autenticado" not in st.session_state:
