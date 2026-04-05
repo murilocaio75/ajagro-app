@@ -63,8 +63,8 @@ else:
         st.session_state["autenticado"] = False
         st.rerun()
 
-    # --- TELA: LANÇAMENTO DE EVENTOS ---
-    if menu == "Lançamento de Eventos":
+# --- TELA: LANÇAMENTO DE EVENTOS (VERSÃO CORRIGIDA) ---
+    elif menu == "Lançamento de Eventos":
         st.header("📝 Registro de Eventos")
         conn = get_connection()
         fazendas = pd.read_sql(text("SELECT id_fazenda, nome_fazenda FROM fazendas"), conn)
@@ -72,44 +72,48 @@ else:
         if fazendas.empty:
             st.warning("Cadastre uma fazenda primeiro em 'Cadastros Base'.")
         else:
-            with st.form("form_evento", clear_on_submit=True):
-                col1, col2 = st.columns(2)
-                with col1:
-                    data_mov = st.date_input("Data do Evento", date.today())
-                    faz_sel = st.selectbox("Fazenda", fazendas['nome_fazenda'])
-                    evento_sel = st.selectbox("Tipo de Evento", EVENTOS_ENTRADA + EVENTOS_SAIDA)
+            # Note que removemos o 'with st.form' para permitir a atualização em tempo real
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                data_mov = st.date_input("Data do Evento", date.today())
+                faz_sel = st.selectbox("Fazenda", fazendas['nome_fazenda'])
+                evento_sel = st.selectbox("Tipo de Evento", EVENTOS_ENTRADA + EVENTOS_SAIDA)
+            
+            with col2:
+                # Agora a lógica condicional reage na hora à mudança do 'evento_sel'
+                if evento_sel == "Entrada/Nascimento":
+                    cat_opcoes = ["Mamando - Machos", "Mamando - Femeas"]
+                else:
+                    cat_opcoes = CATEGORIAS_LISTA
                 
-                with col2:
-                    # CORREÇÃO 1: Regra de categorias condicional
-                    if evento_sel == "Entrada/Nascimento":
-                        cat_opcoes = ["Mamando - Machos", "Mamando - Femeas"]
-                    else:
-                        cat_opcoes = CATEGORIAS_LISTA
+                cat_sel = st.selectbox("Categoria", cat_opcoes)
+                qtd = st.number_input("Quantidade de Cabeças", min_value=1, step=1)
+
+            obs = st.text_area("Observações (Obrigatório para Nascimentos e Saídas)")
+            
+            # Usamos st.button em vez de st.form_submit_button
+            if st.button("Confirmar Lançamento"):
+                id_f = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
+                
+                if is_mes_fechado(conn, data_mov):
+                    st.error("Este mês já foi FECHADO e não permite novos lançamentos.")
+                elif (evento_sel == "Entrada/Nascimento" or evento_sel in EVENTOS_SAIDA) and not obs:
+                    st.error("Para este evento, o campo observação é obrigatório.")
+                else:
+                    pode_gravar = True
+                    if evento_sel in EVENTOS_SAIDA:
+                        saldo = get_saldo_atual(conn, id_f, cat_sel)
+                        if saldo < qtd:
+                            st.error(f"Saldo insuficiente! Estoque atual de {cat_sel}: {saldo} cab.")
+                            pode_gravar = False
                     
-                    cat_sel = st.selectbox("Categoria", cat_opcoes)
-                    qtd = st.number_input("Quantidade de Cabeças", min_value=1, step=1)
-                
-                obs = st.text_area("Observações (Obrigatório para Nascimentos e Saídas)")
-                
-                if st.form_submit_button("Confirmar Lançamento"):
-                    id_f = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
-                    if is_mes_fechado(conn, data_mov):
-                        st.error("Este mês já foi FECHADO e não permite novos lançamentos.")
-                    elif (evento_sel == "Entrada/Nascimento" or evento_sel in EVENTOS_SAIDA) and not obs:
-                        st.error("Para este evento, o campo observação é obrigatório.")
-                    else:
-                        pode_gravar = True
-                        if evento_sel in EVENTOS_SAIDA:
-                            saldo = get_saldo_atual(conn, id_f, cat_sel)
-                            if saldo < qtd:
-                                st.error(f"Saldo insuficiente! Estoque atual de {cat_sel}: {saldo} cab.")
-                                pode_gravar = False
-                        
-                        if pode_gravar:
-                            sql = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
-                            conn.execute(sql, {"d": data_mov, "f": id_f, "q": qtd, "e": evento_sel, "c": cat_sel, "o": obs})
-                            conn.commit()
-                            st.success("Evento registrado com sucesso!")
+                    if pode_gravar:
+                        sql = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
+                        conn.execute(sql, {"d": data_mov, "f": id_f, "q": qtd, "e": evento_sel, "c": cat_sel, "o": obs})
+                        conn.commit()
+                        st.success(f"Sucesso! {qtd} '{cat_sel}' registrado como '{evento_sel}'.")
+                        st.balloons()
         conn.close()
 
     # --- TELA: DASHBOARD & BALANÇO ---
