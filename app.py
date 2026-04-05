@@ -18,7 +18,7 @@ def get_connection():
 # --- CATEGORIAS OFICIAIS (ITEM 6) ---
 CATEGORIAS_LISTA = [
     "Vacas Lactantes", "Vacas Secas", "Vacas a refugar", "Vacas refugadas",
-    "Mamando - Machos", "Mamando - Femeas", "Novilhas até 1 ano",
+    "Mamando - Machos", "Mamando - Fêmeas", "Novilhas até 1 ano",
     "Novilhas de 1 a 2 anos", "Novilhas Prenhas", "Machos"
 ]
 
@@ -91,29 +91,68 @@ else:
                 qtd = st.number_input("Quantidade de Cabeças", min_value=1, step=1)
 
             obs = st.text_area("Observações (Obrigatório para Nascimentos e Saídas)")
-            
-            # Usamos st.button em vez de st.form_submit_button
+
+# --- NOVO BLOCO DO BOTÃO: TRANSFERÊNCIA ATÔMICA E FLUXO ---
             if st.button("Confirmar Lançamento"):
                 id_f = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
                 
+                # Definição do Fluxo Obrigatório de Transferência (Regra 8.4)
+                fluxo_transferencia = {
+                    "Mamando - Machos": "Machos",
+                    "Mamando - Fêmeas": "Novilhas até 1 ano",
+                    "Novilhas até 1 ano": "Novilhas de 1 a 2 anos",
+                    "Novilhas de 1 a 2 anos": "Novilhas Prenhas",
+                    "Novilhas Prenhas": "Vacas Lactantes",
+                    "Vacas Lactantes": "Vacas Secas"
+                }
+
                 if is_mes_fechado(conn, data_mov):
                     st.error("Este mês já foi FECHADO e não permite novos lançamentos.")
                 elif (evento_sel == "Entrada/Nascimento" or evento_sel in EVENTOS_SAIDA) and not obs:
                     st.error("Para este evento, o campo observação é obrigatório.")
                 else:
                     pode_gravar = True
-                    if evento_sel in EVENTOS_SAIDA:
-                        saldo = get_saldo_atual(conn, id_f, cat_sel)
-                        if saldo < qtd:
-                            st.error(f"Saldo insuficiente! Estoque atual de {cat_sel}: {saldo} cab.")
+                    
+                    # Validação de Saldo para Saídas e Transferências (Regra 8.1)
+                    if evento_sel in EVENTOS_SAIDA or evento_sel == "Transferências/Para Outras Categorias":
+                        saldo_atual = get_saldo_atual(conn, id_f, cat_sel)
+                        if saldo_atual < qtd:
+                            st.error(f"Saldo insuficiente! Estoque de {cat_sel}: {saldo_atual} cab.")
                             pode_gravar = False
                     
                     if pode_gravar:
-                        sql = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
-                        conn.execute(sql, {"d": data_mov, "f": id_f, "q": qtd, "e": evento_sel, "c": cat_sel, "o": obs})
-                        conn.commit()
-                        st.success(f"Sucesso! {qtd} '{cat_sel}' registrado como '{evento_sel}'.")
-                        st.balloons()
+                        try:
+                            # Operação para Transferências (Duplo Lançamento)
+                            if evento_sel == "Transferências/Para Outras Categorias":
+                                cat_destino = fluxo_transferencia.get(cat_sel)
+                                
+                                if not cat_destino:
+                                    st.error(f"A categoria '{cat_sel}' não possui um destino definido no fluxo.")
+                                else:
+                                    # 1. Saída da Categoria Atual
+                                    sql_sai = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
+                                    conn.execute(sql_sai, {"d": data_mov, "f": id_f, "q": qtd, "e": "Transferências/Para Outras Categorias", "c": cat_sel, "o": f"Saída p/ {cat_destino}. Obs: {obs}"})
+                                    
+                                    # 2. Entrada na Categoria de Destino (Automática)
+                                    sql_ent = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
+                                    conn.execute(sql_ent, {"d": data_mov, "f": id_f, "q": qtd, "e": "Transferências/De Outras Categorias", "c": cat_destino, "o": f"Entrada vinda de {cat_sel}. Obs: {obs}"})
+                                    
+                                    conn.commit()
+                                    st.success(f"Transferência concluída! {qtd} cab. saíram de {cat_sel} e entraram em {cat_destino}.")
+                                    st.balloons()
+                            
+                            else:
+                                # Lançamentos normais (Entradas, Vendas, Mortes)
+                                sql = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
+                                conn.execute(sql, {"d": data_mov, "f": id_f, "q": qtd, "e": evento_sel, "c": cat_sel, "o": obs})
+                                conn.commit()
+                                st.success(f"Sucesso! {qtd} '{cat_sel}' registrado como '{evento_sel}'.")
+                                st.balloons()
+                        
+                        except Exception as e:
+                            st.error(f"Erro no banco: {e}")
+
+        # --- IMPORTANTE: Manter o fechamento da conexão aqui ---
         conn.close()
 
     # --- TELA: DASHBOARD & BALANÇO ---
