@@ -3,11 +3,12 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import date
 import io
+import plotly.express as px
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="AJAGRO - Gestão Pecuária 3.0", layout="wide")
+st.set_page_config(page_title="AJAGRO - Gestão Pecuária 3.1", layout="wide")
 
 # --- CONEXÃO ---
 def get_connection():
@@ -24,7 +25,7 @@ CATEGORIAS_LISTA = [
 EVENTOS_ENTRADA = ["Entrada/Nascimento", "Entrada/Compras", "Entrada/Outros", "Entrada/Outros/Parcerias", "Transferências/De Outras Categorias", "Transferências/De Outras Fazendas"]
 EVENTOS_SAIDA = ["Saída/Vendas Comerciais", "Saída/Vendas Descartes", "Saída/Abates Comerciais", "Saída/Mortes", "Saída/Doações Extern", "Saída/Doações Intern", "Transferências/Para Outras Categorias", "Transferências/Para Outras Fazendas"]
 
-# --- FUNÇÕES DE VALIDAÇÃO ---
+# --- FUNÇÕES DE APOIO ---
 def get_saldo_atual(conn, fazenda_id, categoria):
     query = text("""
         SELECT SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%' THEN quantidade ELSE -quantidade END) 
@@ -38,12 +39,12 @@ def is_mes_fechado(conn, data_mov):
     res = conn.execute(text("SELECT status FROM fechamentos_mensais WHERE ano_mes = :d"), {"d": prim_dia}).scalar()
     return res == 'Fechado'
 
-# --- SISTEMA DE LOGIN ---
+# --- LOGIN ---
 if "autenticado" not in st.session_state:
     st.session_state["autenticado"] = False
 
 if not st.session_state["autenticado"]:
-    st.markdown("<h1 style='text-align: center;'>🔐 AJAGRO 3.0 - Acesso</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🔐 AJAGRO 3.1 - Acesso</h1>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         with st.form("login"):
@@ -55,9 +56,8 @@ if not st.session_state["autenticado"]:
                     st.rerun()
                 else: st.error("Credenciais inválidas")
 else:
-    # --- MENU LATERAL ---
     st.sidebar.title("Módulo MEG - AJAGRO")
-    menu = st.sidebar.selectbox("Ir para:", ["Dashboard & Balanço", "Lançamento de Eventos", "Cadastros Base", "Fechamento Mensal"])
+    menu = st.sidebar.selectbox("Ir para:", ["Dashboard & Balanço", "Lançamento de Eventos", "Cadastros Base", "Fechamento Mensal", "⚙️ Ajuste de Preços"])
     
     if st.sidebar.button("🚪 Sair do Sistema"):
         st.session_state["autenticado"] = False
@@ -80,7 +80,7 @@ else:
                     evento_sel = st.selectbox("Tipo de Evento", EVENTOS_ENTRADA + EVENTOS_SAIDA)
                 
                 with col2:
-                    # Regra 3.1: Filtro de categoria para Nascimentos
+                    # CORREÇÃO 1: Regra de categorias condicional
                     if evento_sel == "Entrada/Nascimento":
                         cat_opcoes = ["Mamando - Machos", "Mamando - Femeas"]
                     else:
@@ -93,18 +93,16 @@ else:
                 
                 if st.form_submit_button("Confirmar Lançamento"):
                     id_f = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
-                    
                     if is_mes_fechado(conn, data_mov):
                         st.error("Este mês já foi FECHADO e não permite novos lançamentos.")
-                    elif evento_sel == "Entrada/Nascimento" and not obs:
-                        st.error("Para nascimentos, descreva se o parto foi Multípara ou Primípara e o ID.")
+                    elif (evento_sel == "Entrada/Nascimento" or evento_sel in EVENTOS_SAIDA) and not obs:
+                        st.error("Para este evento, o campo observação é obrigatório.")
                     else:
-                        # Regra 8.1: Checagem de Saldo para Saídas
                         pode_gravar = True
                         if evento_sel in EVENTOS_SAIDA:
                             saldo = get_saldo_atual(conn, id_f, cat_sel)
                             if saldo < qtd:
-                                st.error(f"Saldo insuficiente! Saldo atual de {cat_sel}: {saldo} cab.")
+                                st.error(f"Saldo insuficiente! Estoque atual de {cat_sel}: {saldo} cab.")
                                 pode_gravar = False
                         
                         if pode_gravar:
@@ -116,13 +114,17 @@ else:
 
     # --- TELA: DASHBOARD & BALANÇO ---
     elif menu == "Dashboard & Balanço":
-        st.header("📊 Balanço e Evolução")
+        st.header("📊 Balanço e Evolução Patrimonial")
         conn = get_connection()
         
-        # Balanço Acumulado (Item 10)
-        st.sidebar.subheader("Período")
-        d_fim = st.sidebar.date_input("Data do Saldo", date.today())
-        
+        # CORREÇÃO 2: Filtros de Data Inicial e Final
+        st.sidebar.divider()
+        st.sidebar.subheader("Período do Dashboard")
+        hoje = date.today()
+        d_ini = st.sidebar.date_input("Data Inicial", date(hoje.year, hoje.month, 1))
+        d_fim = st.sidebar.date_input("Data Final", hoje)
+
+        # Cálculo do Estoque (Saldo acumulado até Data Final)
         q_balanco = text("""
             SELECT categoria as "Categoria", 
             SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%' THEN quantidade ELSE -quantidade END) as "Estoque"
@@ -131,58 +133,96 @@ else:
         """)
         df_bal = pd.read_sql(q_balanco, conn, params={"f": d_fim})
         
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.subheader(f"Estoque em {d_fim.strftime('%d/%m/%Y')}")
-            st.dataframe(df_bal, use_container_width=True, hide_index=True)
-        
-        with c2:
-            st.subheader("Exportar Dados")
-            # Excel
-            buf_xlsx = io.BytesIO()
-            df_bal.to_excel(buf_xlsx, index=False)
-            st.download_button("📥 Baixar Excel", buf_xlsx.getvalue(), "balanco_ajagro.xlsx")
+        if not df_bal.empty:
+            # Integração com Preços para Valorização
+            query_p = text("SELECT * FROM precos_gestao")
+            df_p = pd.read_sql(query_p, conn)
+            dict_p = dict(zip(df_p['categoria'], df_p['valor']))
             
-            # PDF Simples (Item 11)
-            pdf_buf = io.BytesIO()
-            canv = canvas.Canvas(pdf_buf, pagesize=letter)
-            canv.drawString(50, 750, f"AJAGRO - BALANÇO PATRIMONIAL EM {d_fim}")
-            y_pos = 720
-            for i, row in df_bal.iterrows():
-                canv.drawString(50, y_pos, f"{row['Categoria']}: {row['Estoque']} cab.")
-                y_pos -= 20
-            canv.save()
-            st.download_button("📥 Baixar PDF", pdf_buf.getvalue(), "balanco_ajagro.pdf")
+            df_bal['Preço Unit.'] = df_bal['Categoria'].map(dict_p).fillna(0)
+            df_bal['Total R$'] = df_bal['Estoque'] * df_bal['Preço Unit.']
+            
+            # Métricas
+            total_r = df_bal['Total R$'].sum()
+            total_c = df_bal['Estoque'].sum()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Estoque Total", f"{int(total_c)} cab.")
+            m2.metric("Valorização Total", f"R$ {total_r:,.2f}")
+            m3.metric("Média por Animal", f"R$ {(total_r/total_c if total_c > 0 else 0):,.2f}")
 
-        # Histórico de Lançamentos (Item 2.1)
+            st.divider()
+            col_g, col_t = st.columns([1, 1.2])
+            
+            with col_g:
+                # CORREÇÃO: Retorno do Gráfico de Pizza
+                st.subheader("Distribuição do Patrimônio")
+                fig = px.pie(df_bal[df_bal['Total R$'] > 0], values='Total R$', names='Categoria', hole=0.4)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col_t:
+                st.subheader("Tabela de Participação")
+                st.dataframe(df_bal.style.format({'Preço Unit.': 'R$ {:.2f}', 'Total R$': 'R$ {:.2f}'}), use_container_width=True, hide_index=True)
+                
+                c_ex1, c_ex2 = st.columns(2)
+                with c_ex1:
+                    buf = io.BytesIO()
+                    df_bal.to_excel(buf, index=False)
+                    st.download_button("📥 Excel", buf.getvalue(), "balanco.xlsx")
+                with c_ex2:
+                    pdf_buf = io.BytesIO()
+                    canv = canvas.Canvas(pdf_buf, pagesize=letter)
+                    canv.drawString(50, 750, f"AJAGRO - BALANÇO EM {d_fim.strftime('%d/%m/%Y')}")
+                    y = 720
+                    for _, row in df_bal.iterrows():
+                        canv.drawString(50, y, f"{row['Categoria']}: {row['Estoque']} cab. - R$ {row['Total R$']:,.2f}")
+                        y -= 20
+                    canv.save()
+                    st.download_button("📥 PDF", pdf_buf.getvalue(), "balanco.pdf")
+
+        # Histórico de Lançamentos (CORREÇÃO 3: Data em padrão BR)
         st.divider()
-        st.subheader("📑 Últimos Lançamentos (Histórico)")
+        st.subheader("📑 Últimos Lançamentos")
         df_hist = pd.read_sql(text("SELECT TO_CHAR(data_movimento, 'DD/MM/YYYY') as Data, evento as Evento, categoria as Categoria, quantidade as Quantidade FROM lanc_estoque ORDER BY id_lancamento DESC LIMIT 20"), conn)
         st.table(df_hist)
         conn.close()
 
-    # --- TELA: CADASTROS BASE ---
+    # --- OUTRAS TELAS MANTIDAS ---
     elif menu == "Cadastros Base":
         st.header("🏢 Cadastro de Fazendas")
-        with st.form("add_fazenda"):
+        with st.form("add_f"):
             n = st.text_input("Nome da Fazenda")
             c = st.text_input("CNPJ/CPF")
-            if st.form_submit_button("Salvar Fazenda"):
+            if st.form_submit_button("Salvar"):
                 conn = get_connection()
                 conn.execute(text("INSERT INTO fazendas (nome_fazenda, cnpj_cpf) VALUES (:n, :c)"), {"n": n, "c": c})
                 conn.commit()
                 conn.close()
                 st.success("Fazenda cadastrada!")
 
-    # --- TELA: FECHAMENTO MENSAL (ITEM 9) ---
     elif menu == "Fechamento Mensal":
         st.header("🔒 Fechamento Contábil")
-        st.info("O fechamento impede edições retroativas para garantir a auditoria.")
         mes = st.date_input("Mês para Fechar", date.today().replace(day=1))
         if st.button("Executar Fechamento"):
             conn = get_connection()
             conn.execute(text("INSERT INTO fechamentos_mensais (ano_mes, status) VALUES (:m, 'Fechado') ON CONFLICT (ano_mes) DO UPDATE SET status = 'Fechado'"), {"m": mes})
             conn.commit()
             conn.close()
-            st.success(f"Mês {mes.strftime('%m/%Y')} fechado com sucesso!")
-            
+            st.success(f"Mês {mes.strftime('%m/%Y')} fechado!")
+
+    elif menu == "⚙️ Ajuste de Preços":
+        st.header("⚙️ Ajuste de Preços")
+        conn = get_connection()
+        p_df = pd.read_sql(text("SELECT * FROM precos_gestao"), conn)
+        with st.form("p"):
+            dict_n = {}
+            for cat in CATEGORIAS_LISTA:
+                val_atual = p_df[p_df['categoria'] == cat]['valor'].values[0] if cat in p_df['categoria'].values else 0.0
+                dict_n[cat] = st.number_input(f"{cat} (R$)", value=float(val_atual))
+            if st.form_submit_button("Salvar Preços"):
+                for c, v in dict_n.items():
+                    conn.execute(text("INSERT INTO precos_gestao (categoria, valor) VALUES (:c, :v) ON CONFLICT (categoria) DO UPDATE SET valor = EXCLUDED.valor"), {"c": c, "v": v})
+                conn.commit()
+                st.success("Preços atualizados!")
+        conn.close()
+
+        
