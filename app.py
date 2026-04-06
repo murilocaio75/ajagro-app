@@ -530,7 +530,7 @@ else:
                 for _, row in df_extrato.iterrows():
                     data_ext.append([
                         row['Data'], row['Fazenda'], row['Categoria'],
-                        row['Evento'][:30], str(int(row['Entrada (-)'])), str(int(row['Saída (-)']))
+                        row['Evento'][:30], str(int(row['Entrada (+)'])), str(int(row['Saída (-)']))
                     ])
                 t2 = Table(data_ext, hAlign='LEFT',
                            colWidths=[50, 70, 90, 130, 50, 50])
