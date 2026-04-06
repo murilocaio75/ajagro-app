@@ -101,7 +101,8 @@ else:
     st.sidebar.title("Módulo MEG - AJAGRO")
     menu = st.sidebar.selectbox("Ir para:", [
         "Dashboard & Balanço",
-        "📋 Módulo de Auditoria",       # NOVO em v3.2
+        "📋 Módulo de Auditoria",
+        "📊 KPIs Zootécnicos",           # NOVO em v3.2
         "Lançamento de Eventos",
         "Cadastros Base",
         "Fechamento Mensal",
@@ -567,29 +568,301 @@ else:
                 st.success("Fazenda cadastrada!")
 
     # =========================================================
+    # NOVA TELA v3.2: KPIs ZOOTÉCNICOS (SEMÁFORO)
+    # =========================================================
+    # MAPEAMENTO DE CATEGORIAS → GRUPOS DE KPI:
+    #
+    #   Bezerros (0-60 dias) → "Mamando - Machos" + "Mamando - Fêmeas"
+    #   Recria (2-12 meses)  → "Novilhas até 1 ano"
+    #   Novilhas (>12 meses) → "Novilhas de 1 a 2 anos" + "Novilhas Prenhas"
+    #   Vacas Adultas        → "Vacas Lactantes" + "Vacas Secas" +
+    #                          "Vacas a refugar" + "Vacas refugadas"
+    #
+    # DENOMINADOR: Total do período = Saldo Inicial + Entradas do período
+    # ÓBITOS:      evento = 'Saída/Mortes' dentro do período filtrado
+    #
+    # SEMÁFORO (conforme especificação do cliente):
+    #   Verde    = dentro da meta ideal
+    #   Amarelo  = aceitável (atenção)
+    #   Vermelho = crítico (alerta imediato)
+    # =========================================================
+    elif menu == "📊 KPIs Zootécnicos":
+        st.header("📊 KPIs Zootécnicos — Painel de Indicadores")
+
+        conn = get_connection()
+        fazendas = pd.read_sql(text("SELECT id_fazenda, nome_fazenda FROM fazendas"), conn)
+
+        st.sidebar.divider()
+        st.sidebar.subheader("Filtros dos KPIs")
+        hoje = date.today()
+        d_ini = st.sidebar.date_input("Data Inicial", date(hoje.year, hoje.month, 1), key="kpi_ini")
+        d_fim = st.sidebar.date_input("Data Final", hoje, key="kpi_fim")
+        faz_opcoes = ["Todas as Fazendas"] + fazendas['nome_fazenda'].tolist()
+        faz_sel = st.sidebar.selectbox("Fazenda", faz_opcoes, key="kpi_faz")
+
+        # Monta filtro de fazenda
+        filtro_faz = ""
+        params = {"d_ini": d_ini, "d_fim": d_fim}
+        if faz_sel != "Todas as Fazendas":
+            id_faz = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
+            filtro_faz = "AND id_fazenda = :id_faz"
+            params["id_faz"] = id_faz
+
+        # ----------------------------------------------------------
+        # FUNÇÃO AUXILIAR: calcula óbitos e população de um grupo
+        # ----------------------------------------------------------
+        def calc_kpi_grupo(conn, categorias: list, params: dict, filtro_faz: str):
+            cats_sql = ", ".join([f"'{c}'" for c in categorias])
+
+            # Óbitos no período
+            q_obitos = text(f"""
+                SELECT COALESCE(SUM(quantidade), 0)
+                FROM lanc_estoque
+                WHERE evento = 'Saída/Mortes'
+                  AND categoria IN ({cats_sql})
+                  AND data_movimento BETWEEN :d_ini AND :d_fim
+                  {filtro_faz}
+            """)
+            obitos = conn.execute(q_obitos, params).scalar() or 0
+
+            # Saldo inicial (acumulado antes de d_ini)
+            q_saldo_ini = text(f"""
+                SELECT COALESCE(SUM(
+                    CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
+                         THEN quantidade ELSE -quantidade END
+                ), 0)
+                FROM lanc_estoque
+                WHERE categoria IN ({cats_sql})
+                  AND data_movimento < :d_ini
+                  {filtro_faz}
+            """)
+            saldo_ini = conn.execute(q_saldo_ini, params).scalar() or 0
+
+            # Entradas no período
+            q_entradas = text(f"""
+                SELECT COALESCE(SUM(quantidade), 0)
+                FROM lanc_estoque
+                WHERE (evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%')
+                  AND categoria IN ({cats_sql})
+                  AND data_movimento BETWEEN :d_ini AND :d_fim
+                  {filtro_faz}
+            """)
+            entradas = conn.execute(q_entradas, params).scalar() or 0
+
+            populacao = saldo_ini + entradas
+            taxa = (obitos / populacao * 100) if populacao > 0 else 0.0
+            return int(obitos), int(populacao), round(taxa, 2)
+
+        # ----------------------------------------------------------
+        # FUNÇÃO DO SEMÁFORO
+        # ----------------------------------------------------------
+        def semaforo(taxa, verde_max, amarelo_max):
+            """Retorna (emoji, cor_hex, label) conforme os limites."""
+            if taxa < verde_max:
+                return "🟢", "#27ae60", "IDEAL"
+            elif taxa <= amarelo_max:
+                return "🟡", "#f39c12", "ATENÇÃO"
+            else:
+                return "🔴", "#e74c3c", "CRÍTICO"
+
+        # ----------------------------------------------------------
+        # CÁLCULO DOS 4 KPIs DE MORTALIDADE
+        # ----------------------------------------------------------
+        grupos_mortalidade = {
+            "Bezerros (0–60 dias)": {
+                "categorias": ["Mamando - Machos", "Mamando - Fêmeas"],
+                "verde_max": 3.0, "amarelo_max": 5.0,
+                "descricao": "Sobrevivência na fase mais crítica da vida."
+            },
+            "Recria (2–12 meses)": {
+                "categorias": ["Novilhas até 1 ano"],
+                "verde_max": 3.0, "amarelo_max": 5.0,
+                "descricao": "Saúde dos animais em desenvolvimento."
+            },
+            "Novilhas (>12 meses)": {
+                "categorias": ["Novilhas de 1 a 2 anos", "Novilhas Prenhas"],
+                "verde_max": 1.0, "amarelo_max": 2.0,
+                "descricao": "Fêmeas jovens aptas à reprodução."
+            },
+            "Vacas Adultas": {
+                "categorias": ["Vacas Lactantes", "Vacas Secas",
+                               "Vacas a refugar", "Vacas refugadas"],
+                "verde_max": 3.0, "amarelo_max": 5.0,
+                "descricao": "Perda do ativo principal gerador de receita."
+            },
+        }
+
+        st.subheader(f"🚦 Taxas de Mortalidade — {d_ini.strftime('%d/%m/%Y')} a {d_fim.strftime('%d/%m/%Y')}")
+        st.caption(f"Fazenda: **{faz_sel}** | Denominador: Saldo Inicial + Entradas do período")
+
+        # Grade 2x2 para os cards de mortalidade
+        col_pares = [st.columns(2), st.columns(2)]
+        kpi_results = []
+        for idx, (nome, cfg) in enumerate(grupos_mortalidade.items()):
+            obitos, pop, taxa = calc_kpi_grupo(conn, cfg["categorias"], params, filtro_faz)
+            emoji, cor, label = semaforo(taxa, cfg["verde_max"], cfg["amarelo_max"])
+            kpi_results.append({
+                "nome": nome, "obitos": obitos, "pop": pop,
+                "taxa": taxa, "emoji": emoji, "cor": cor, "label": label,
+                "descricao": cfg["descricao"],
+                "verde_max": cfg["verde_max"], "amarelo_max": cfg["amarelo_max"]
+            })
+            col = col_pares[idx // 2][idx % 2]
+            with col:
+                st.markdown(f"""
+                <div style="border:2px solid {cor}; border-radius:12px; padding:16px;
+                            background:{'#f9fbe7' if cor=='#f39c12' else ('#fdecea' if cor=='#e74c3c' else '#f0faf4')};">
+                    <div style="font-size:1.1rem; font-weight:700; color:#2c3e50;">{emoji} {nome}</div>
+                    <div style="font-size:2.4rem; font-weight:900; color:{cor};">{taxa:.2f}%</div>
+                    <div style="font-size:0.85rem; color:#555;">
+                        {obitos} óbitos / {pop} animais no período
+                    </div>
+                    <div style="margin-top:6px;">
+                        <span style="background:{cor}; color:white; padding:2px 10px;
+                                     border-radius:20px; font-size:0.8rem; font-weight:700;">
+                            {label}
+                        </span>
+                    </div>
+                    <div style="font-size:0.78rem; color:#777; margin-top:8px;">{cfg['descricao']}</div>
+                    <div style="font-size:0.75rem; color:#aaa; margin-top:4px;">
+                        Meta: &lt;{cfg['verde_max']}% ✅ | Atenção: até {cfg['amarelo_max']}% ⚠️
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
+        # ----------------------------------------------------------
+        # KPIs DE COMPOSIÇÃO DO REBANHO
+        # ----------------------------------------------------------
+        st.subheader("🐄 Composição e Eficiência do Rebanho")
+
+        # Busca saldo acumulado até d_fim por categoria
+        q_saldo = text(f"""
+            SELECT categoria,
+                   SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
+                            THEN quantidade ELSE -quantidade END) as saldo
+            FROM lanc_estoque
+            WHERE data_movimento <= :d_fim
+            {filtro_faz}
+            GROUP BY categoria
+        """)
+        df_saldo = pd.read_sql(q_saldo, conn, params={"d_fim": d_fim, **({
+            "id_faz": params["id_faz"]} if "id_faz" in params else {})})
+        saldo_dict = dict(zip(df_saldo['categoria'], df_saldo['saldo'].clip(lower=0)))
+
+        lactantes  = saldo_dict.get("Vacas Lactantes", 0)
+        secas      = saldo_dict.get("Vacas Secas", 0)
+        total_rebanho = sum(v for v in saldo_dict.values() if v > 0)
+        total_vacas = lactantes + secas
+
+        pct_lact_vacas    = (lactantes / total_vacas * 100)    if total_vacas > 0    else 0.0
+        pct_lact_rebanho  = (lactantes / total_rebanho * 100)  if total_rebanho > 0  else 0.0
+
+        # Semáforos de composição (metas invertidas: abaixo é pior)
+        def semaforo_comp(valor, verde_min, amarelo_min):
+            if valor >= verde_min:
+                return "🟢", "#27ae60", "IDEAL"
+            elif valor >= amarelo_min:
+                return "🟡", "#f39c12", "ATENÇÃO"
+            else:
+                return "🔴", "#e74c3c", "CRÍTICO"
+
+        em1, cor1, lb1 = semaforo_comp(pct_lact_vacas,   83.0, 75.0)
+        em2, cor2, lb2 = semaforo_comp(pct_lact_rebanho, 55.0, 50.0)
+
+        c1, c2 = st.columns(2)
+        for col, emoji, cor, label, titulo, valor, meta_v, meta_a, descricao in [
+            (c1, em1, cor1, lb1,
+             "% Lactantes / Total de Vacas", pct_lact_vacas,
+             "≥ 83%", "75% a 82%",
+             f"Lactantes: {int(lactantes)} | Secas: {int(secas)} | Total Vacas: {int(total_vacas)}"),
+            (c2, em2, cor2, lb2,
+             "% Lactantes / Rebanho Total", pct_lact_rebanho,
+             "≥ 55%", "50% a 54%",
+             f"Lactantes: {int(lactantes)} | Rebanho Total: {int(total_rebanho)} animais"),
+        ]:
+            with col:
+                st.markdown(f"""
+                <div style="border:2px solid {cor}; border-radius:12px; padding:16px;
+                            background:{'#f9fbe7' if cor=='#f39c12' else ('#fdecea' if cor=='#e74c3c' else '#f0faf4')};">
+                    <div style="font-size:1.1rem; font-weight:700; color:#2c3e50;">{emoji} {titulo}</div>
+                    <div style="font-size:2.4rem; font-weight:900; color:{cor};">{valor:.1f}%</div>
+                    <div style="font-size:0.85rem; color:#555;">{descricao}</div>
+                    <div style="margin-top:6px;">
+                        <span style="background:{cor}; color:white; padding:2px 10px;
+                                     border-radius:20px; font-size:0.8rem; font-weight:700;">
+                            {label}
+                        </span>
+                    </div>
+                    <div style="font-size:0.75rem; color:#aaa; margin-top:8px;">
+                        Meta Ideal: {meta_v} ✅ | Atenção: {meta_a} ⚠️
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
+        # ----------------------------------------------------------
+        # TABELA RESUMO DOS KPIs
+        # ----------------------------------------------------------
+        st.subheader("📋 Tabela Resumo — Todos os Indicadores")
+        rows = []
+        for r in kpi_results:
+            rows.append({
+                "Indicador":   r["nome"],
+                "Óbitos":      r["obitos"],
+                "População":   r["pop"],
+                "Taxa (%)":    r["taxa"],
+                "Status":      f"{r['emoji']} {r['label']}",
+                "Meta Verde":  f"< {r['verde_max']}%",
+                "Limite Crítico": f"> {r['amarelo_max']}%",
+            })
+        rows.append({
+            "Indicador":   "% Lactantes / Total Vacas",
+            "Óbitos":      "-",
+            "População":   int(total_vacas),
+            "Taxa (%)":    round(pct_lact_vacas, 2),
+            "Status":      f"{em1} {lb1}",
+            "Meta Verde":  "≥ 83%",
+            "Limite Crítico": "< 75%",
+        })
+        rows.append({
+            "Indicador":   "% Lactantes / Rebanho Total",
+            "Óbitos":      "-",
+            "População":   int(total_rebanho),
+            "Taxa (%)":    round(pct_lact_rebanho, 2),
+            "Status":      f"{em2} {lb2}",
+            "Meta Verde":  "≥ 55%",
+            "Limite Crítico": "< 50%",
+        })
+        df_resumo = pd.DataFrame(rows)
+        st.dataframe(df_resumo, use_container_width=True, hide_index=True)
+
+        # Exportação Excel
+        buf_kpi = io.BytesIO()
+        df_resumo.to_excel(buf_kpi, index=False)
+        st.download_button("📥 Exportar KPIs (Excel)", buf_kpi.getvalue(),
+                           "kpis_zootecnicos.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        conn.close()
+
+    # =========================================================
     # TELA: FECHAMENTO MENSAL
     # =========================================================
     elif menu == "Fechamento Mensal":
-    st.header("🔒 Fechamento Contábil")
-    mes = st.date_input("Mês para Fechar", date.today().replace(day=1))
-    
-    # Sempre normaliza para o primeiro dia, independente do que foi selecionado
-    mes_normalizado = mes.replace(day=1)
-    
-    if mes != mes_normalizado:
-        st.warning(f"A data será ajustada para o primeiro dia do mês: {mes_normalizado.strftime('%d/%m/%Y')}")
-    
-    st.info(f"Mês a ser fechado: **{mes_normalizado.strftime('%m/%Y')}**")
-    
-    if st.button("Executar Fechamento"):
-        conn = get_connection()
-        conn.execute(text("""
-            INSERT INTO fechamentos_mensais (ano_mes, status) VALUES (:m, 'Fechado')
-            ON CONFLICT (ano_mes) DO UPDATE SET status = 'Fechado'
-        """), {"m": mes_normalizado})  # ← sempre o primeiro dia
-        conn.commit()
-        conn.close()
-        st.success(f"Mês {mes_normalizado.strftime('%m/%Y')} fechado!")
+        st.header("🔒 Fechamento Contábil")
+        mes = st.date_input("Mês para Fechar", date.today().replace(day=1))
+        if st.button("Executar Fechamento"):
+            conn = get_connection()
+            conn.execute(text("""
+                INSERT INTO fechamentos_mensais (ano_mes, status) VALUES (:m, 'Fechado')
+                ON CONFLICT (ano_mes) DO UPDATE SET status = 'Fechado'
+            """), {"m": mes})
+            conn.commit()
+            conn.close()
+            st.success(f"Mês {mes.strftime('%m/%Y')} fechado!")
 
     # =========================================================
     # TELA: AJUSTE DE PREÇOS
