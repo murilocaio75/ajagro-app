@@ -570,17 +570,26 @@ else:
     # TELA: FECHAMENTO MENSAL
     # =========================================================
     elif menu == "Fechamento Mensal":
-        st.header("🔒 Fechamento Contábil")
-        mes = st.date_input("Mês para Fechar", date.today().replace(day=1))
-        if st.button("Executar Fechamento"):
-            conn = get_connection()
-            conn.execute(text("""
-                INSERT INTO fechamentos_mensais (ano_mes, status) VALUES (:m, 'Fechado')
-                ON CONFLICT (ano_mes) DO UPDATE SET status = 'Fechado'
-            """), {"m": mes})
-            conn.commit()
-            conn.close()
-            st.success(f"Mês {mes.strftime('%m/%Y')} fechado!")
+    st.header("🔒 Fechamento Contábil")
+    mes = st.date_input("Mês para Fechar", date.today().replace(day=1))
+    
+    # Sempre normaliza para o primeiro dia, independente do que foi selecionado
+    mes_normalizado = mes.replace(day=1)
+    
+    if mes != mes_normalizado:
+        st.warning(f"A data será ajustada para o primeiro dia do mês: {mes_normalizado.strftime('%d/%m/%Y')}")
+    
+    st.info(f"Mês a ser fechado: **{mes_normalizado.strftime('%m/%Y')}**")
+    
+    if st.button("Executar Fechamento"):
+        conn = get_connection()
+        conn.execute(text("""
+            INSERT INTO fechamentos_mensais (ano_mes, status) VALUES (:m, 'Fechado')
+            ON CONFLICT (ano_mes) DO UPDATE SET status = 'Fechado'
+        """), {"m": mes_normalizado})  # ← sempre o primeiro dia
+        conn.commit()
+        conn.close()
+        st.success(f"Mês {mes_normalizado.strftime('%m/%Y')} fechado!")
 
     # =========================================================
     # TELA: AJUSTE DE PREÇOS
