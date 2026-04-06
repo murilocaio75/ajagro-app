@@ -35,17 +35,18 @@ def get_saldo_atual(conn, fazenda_id, categoria):
     return res if res else 0
 
 def is_mes_fechado(conn, data_mov):
-    # Forçamos a data de movimento para o primeiro dia do mês para comparar com o banco
-    primeiro_dia_mes = date(data_mov.year, data_mov.month, 1)
+    # Forçamos a data para o primeiro dia do mês e transformamos em string ISO
+    # Exemplo: 25/03/2026 vira '2026-03-01'
+    primeiro_dia_iso = data_mov.replace(day=1).strftime('%Y-%m-%d')
     
-    # Buscamos qualquer registro de 'Fechado' para aquele mês específico
+    # Comparamos como string no banco de dados para evitar erros de fuso horário
     query = text("""
         SELECT status FROM fechamentos_mensais 
-        WHERE CAST(ano_mes AS DATE) = :d AND status = 'Fechado'
+        WHERE TO_CHAR(ano_mes, 'YYYY-MM-DD') = :d AND status = 'Fechado'
     """)
     
     try:
-        res = conn.execute(query, {"d": primeiro_dia_mes}).fetchone()
+        res = conn.execute(query, {"d": primeiro_dia_iso}).fetchone()
         return res is not None
     except:
         return False
