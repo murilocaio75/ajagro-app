@@ -414,7 +414,7 @@ else:
 
         st.dataframe(
             df_display.style
-                .applymap(highlight_saldo, subset=['Saldo Final'])
+                .map(highlight_saldo, subset=['Saldo Final'])
                 .format({'Saldo Inicial': '{:.0f}', 'Entradas': '{:.0f}',
                          'Saídas': '{:.0f}', 'Saldo Final': '{:.0f}'}),
             use_container_width=True,
