@@ -7,19 +7,36 @@ import plotly.express as px
 import plotly.graph_objects as go
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.pdfgen import canvas
-from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="AJAGRO - Gestão Pecuária 3.2", layout="wide")
+st.set_page_config(page_title="AJAGRO - Gestão Pecuária 3.3", layout="wide")
+
+# ==============================================================
+# FORMATAÇÃO NUMÉRICA BRASILEIRA (ponto milhar, vírgula decimal)
+# ==============================================================
+def fmt_br(valor, decimais=0):
+    """Formata número no padrão brasileiro: 1.234,56"""
+    if pd.isna(valor):
+        return "0"
+    fmt = f"{float(valor):,.{decimais}f}"
+    # troca separadores: , -> temp, . -> ,, temp -> .
+    return fmt.replace(",", "X").replace(".", ",").replace("X", ".")
+
+def fmt_cab(valor):
+    return f"{fmt_br(valor)} cab."
+
+def fmt_brl(valor):
+    return f"R$ {fmt_br(valor, 2)}"
 
 # --- CONEXÃO ---
 def get_connection():
     db_url = st.secrets["DB_CONN_STRING"].replace("postgres://", "postgresql+psycopg2://", 1)
     return create_engine(db_url).connect()
 
-# --- CATEGORIAS OFICIAIS (ITEM 6) ---
+# --- CATEGORIAS OFICIAIS ---
 CATEGORIAS_LISTA = [
     "Vacas Lactantes", "Vacas Secas", "Vacas a refugar", "Vacas refugadas",
     "Mamando - Machos", "Mamando - Fêmeas", "Novilhas até 1 ano",
@@ -38,6 +55,33 @@ EVENTOS_SAIDA = [
     "Transferências/Para Outras Categorias", "Transferências/Para Outras Fazendas"
 ]
 
+# ==============================================================
+# FLUXO DE TRANSFERÊNCIAS AUTOMÁTICAS v3.3
+# ==============================================================
+# Estrutura: origem -> lista de destinos possíveis
+# Quando há apenas 1 destino, o sistema avança automaticamente.
+# Quando há múltiplos destinos, o usuário escolhe (árvore de decisão).
+#
+# ⏳ PENDENTE: Ajagro irá enviar detalhes dos fluxos de retrocesso
+#    (ex.: Novilha Prenha -> aborto -> Novilhas de 1 a 2 anos)
+#    e demais subcategorias. Estrutura já preparada abaixo.
+# ==============================================================
+FLUXO_TRANSFERENCIA = {
+    # Destino único → avanço automático
+    "Mamando - Machos":      ["Machos"],
+    "Mamando - Fêmeas":      ["Novilhas até 1 ano"],
+    "Novilhas até 1 ano":    ["Novilhas de 1 a 2 anos"],
+    "Novilhas de 1 a 2 anos":["Novilhas Prenhas"],
+
+    # Múltiplos destinos → usuário escolhe (v3.3)
+    "Novilhas Prenhas":      ["Vacas Lactantes", "Vacas a refugar", "Vacas refugadas"],
+    "Vacas Lactantes":       ["Vacas Secas", "Vacas a refugar", "Vacas refugadas"],
+    "Vacas Secas":           ["Vacas Lactantes", "Vacas a refugar", "Vacas refugadas"],
+
+    # ⏳ Fluxos de retrocesso — aguardando detalhes da Ajagro
+    # "Novilhas Prenhas": += ["Novilhas de 1 a 2 anos"],  # aborto
+}
+
 # --- FUNÇÕES DE APOIO ---
 def get_saldo_atual(conn, fazenda_id, categoria):
     query = text("""
@@ -48,24 +92,19 @@ def get_saldo_atual(conn, fazenda_id, categoria):
     res = conn.execute(query, {"f": fazenda_id, "c": categoria}).scalar()
     return res if res else 0
 
+def get_historico_categoria(conn, fazenda_id, categoria, limite=5):
+    """Retorna os últimos lançamentos de uma categoria para o histórico visual."""
+    query = text("""
+        SELECT TO_CHAR(data_movimento, 'DD/MM/YYYY') as data,
+               evento, quantidade, observacao
+        FROM lanc_estoque
+        WHERE id_fazenda = :f AND categoria = :c
+        ORDER BY id_lancamento DESC
+        LIMIT :l
+    """)
+    return pd.read_sql(query, conn, params={"f": fazenda_id, "c": categoria, "l": limite})
 
-# ============================================================
-# CORREÇÃO v3.2 — Bug de Fuso Horário em is_mes_fechado
-# ============================================================
-# PROBLEMA ANTERIOR:
-#   TO_CHAR(ano_mes, 'YYYY-MM-DD') = :d
-#   A coluna ano_mes é TIMESTAMPTZ no Supabase.
-#   Dependendo do timezone do servidor, '2026-03-01 00:00:00+00'
-#   pode ser convertida para '2026-02-28' via TO_CHAR, fazendo a
-#   comparação falhar silenciosamente e liberando lançamentos
-#   retroativos em meses já fechados.
-#
-# SOLUÇÃO:
-#   Forçar a normalização para UTC com AT TIME ZONE 'UTC' antes
-#   de converter para DATE. Comparar DATE vs DATE, sem strings.
-# ============================================================
 def is_mes_fechado(conn, data_mov):
-    # Normaliza para o primeiro dia do mês como objeto date Python
     primeiro_dia = data_mov.replace(day=1)
     query = text("""
         SELECT status FROM fechamentos_mensais
@@ -78,13 +117,12 @@ def is_mes_fechado(conn, data_mov):
     except:
         return False
 
-
 # --- LOGIN ---
 if "autenticado" not in st.session_state:
     st.session_state["autenticado"] = False
 
 if not st.session_state["autenticado"]:
-    st.markdown("<h1 style='text-align: center;'>🔐 AJAGRO 3.2 - Acesso</h1>",
+    st.markdown("<h1 style='text-align: center;'>🔐 AJAGRO 3.3 - Acesso</h1>",
                 unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -102,7 +140,7 @@ else:
     menu = st.sidebar.selectbox("Ir para:", [
         "Dashboard & Balanço",
         "📋 Módulo de Auditoria",
-        "📊 KPIs Zootécnicos",           # NOVO em v3.2
+        "📊 KPIs Zootécnicos",
         "Lançamento de Eventos",
         "Cadastros Base",
         "Fechamento Mensal",
@@ -126,72 +164,171 @@ else:
         else:
             col1, col2 = st.columns(2)
             with col1:
-                data_mov = st.date_input("Data do Evento", date.today())
-                faz_sel = st.selectbox("Fazenda", fazendas['nome_fazenda'])
-                evento_sel = st.selectbox("Tipo de Evento", EVENTOS_ENTRADA + EVENTOS_SAIDA)
+                data_mov    = st.date_input("Data do Evento", date.today())
+                faz_sel     = st.selectbox("Fazenda", fazendas['nome_fazenda'])
+                evento_sel  = st.selectbox("Tipo de Evento", EVENTOS_ENTRADA + EVENTOS_SAIDA)
             with col2:
                 if evento_sel == "Entrada/Nascimento":
                     cat_opcoes = ["Mamando - Machos", "Mamando - Fêmeas"]
                 else:
                     cat_opcoes = CATEGORIAS_LISTA
                 cat_sel = st.selectbox("Categoria", cat_opcoes)
-                qtd = st.number_input("Quantidade de Cabeças", min_value=1, step=1)
-                obs = st.text_area("Observações (Obrigatório para Nascimentos e Saídas)")
+                qtd     = st.number_input("Quantidade de Cabeças", min_value=1, step=1)
+                obs     = st.text_area("Observações (Obrigatório para Nascimentos e Saídas)")
 
-            fluxo_transferencia = {
-                "Mamando - Machos":      "Machos",
-                "Mamando - Fêmeas":      "Novilhas até 1 ano",
-                "Novilhas até 1 ano":    "Novilhas de 1 a 2 anos",
-                "Novilhas de 1 a 2 anos":"Novilhas Prenhas",
-                "Novilhas Prenhas":      "Vacas Lactantes",
-                "Vacas Lactantes":       "Vacas Secas"
-            }
+            id_f = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
 
-            if st.button("Confirmar Lançamento"):
-                id_f = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
+            # --------------------------------------------------
+            # HISTÓRICO VISUAL — saldo e últimos lançamentos
+            # --------------------------------------------------
+            saldo_atual = get_saldo_atual(conn, id_f, cat_sel)
+            df_hist_cat = get_historico_categoria(conn, id_f, cat_sel)
 
-                # ------------------------------------------------
-                # VALIDAÇÃO: Mês Fechado (usa função corrigida v3.2)
-                # ------------------------------------------------
+            with st.expander(f"📊 Histórico de '{cat_sel}' — Saldo atual: {fmt_cab(saldo_atual)}", expanded=True):
+                col_s1, col_s2 = st.columns([1, 2])
+                with col_s1:
+                    st.metric("Saldo Atual", fmt_cab(saldo_atual))
+
+                    # Simula o saldo após o lançamento atual (preview)
+                    if evento_sel in EVENTOS_SAIDA or evento_sel == "Transferências/Para Outras Categorias":
+                        saldo_depois = saldo_atual - qtd
+                        delta_txt    = f"−{fmt_br(qtd)} cab."
+                        delta_color  = "inverse"
+                    elif evento_sel in EVENTOS_ENTRADA or evento_sel == "Transferências/De Outras Categorias":
+                        saldo_depois = saldo_atual + qtd
+                        delta_txt    = f"+{fmt_br(qtd)} cab."
+                        delta_color  = "normal"
+                    else:
+                        saldo_depois = saldo_atual
+                        delta_txt    = "—"
+                        delta_color  = "off"
+
+                    st.metric(
+                        "Saldo após lançamento (previsão)",
+                        fmt_cab(saldo_depois),
+                        delta=delta_txt,
+                        delta_color=delta_color
+                    )
+
+                with col_s2:
+                    if not df_hist_cat.empty:
+                        st.caption("Últimos lançamentos desta categoria:")
+                        for _, row in df_hist_cat.iterrows():
+                            eh_entrada = (
+                                "Entrada" in str(row['evento']) or
+                                "Transferências/De" in str(row['evento'])
+                            )
+                            icone = "🟢 +" if eh_entrada else "🔴 −"
+                            st.markdown(
+                                f"`{row['data']}` {icone}**{fmt_br(row['quantidade'])} cab.** "
+                                f"— _{row['evento']}_"
+                            )
+                    else:
+                        st.info("Nenhum lançamento anterior nesta categoria.")
+
+            # --------------------------------------------------
+            # SELETOR DE DESTINO para transferências com múltiplos destinos
+            # --------------------------------------------------
+            cat_destino_sel = None
+            if evento_sel == "Transferências/Para Outras Categorias":
+                destinos = FLUXO_TRANSFERENCIA.get(cat_sel, [])
+                if len(destinos) == 0:
+                    st.warning(f"⚠️ A categoria '{cat_sel}' não possui fluxo de destino definido.")
+                elif len(destinos) == 1:
+                    cat_destino_sel = destinos[0]
+                    st.info(f"🔀 Destino automático: **{cat_destino_sel}**")
+                else:
+                    st.markdown("**🌿 Escolha o destino da transferência:**")
+                    cols_dest = st.columns(len(destinos))
+                    for i, dest in enumerate(destinos):
+                        saldo_dest = get_saldo_atual(conn, id_f, dest)
+                        with cols_dest[i]:
+                            if st.button(
+                                f"➡️ {dest}\n\nSaldo atual: {fmt_cab(saldo_dest)}",
+                                key=f"dest_{i}",
+                                use_container_width=True
+                            ):
+                                st.session_state["cat_destino_escolhido"] = dest
+                    if "cat_destino_escolhido" in st.session_state:
+                        cat_destino_sel = st.session_state["cat_destino_escolhido"]
+                        st.success(f"✅ Destino selecionado: **{cat_destino_sel}**")
+
+            # --------------------------------------------------
+            # CONFIRMAR LANÇAMENTO
+            # --------------------------------------------------
+            if st.button("Confirmar Lançamento", type="primary"):
                 if is_mes_fechado(conn, data_mov):
-                    st.error(f"⛔ O mês {data_mov.strftime('%m/%Y')} já foi FECHADO e não "
-                             f"permite novos lançamentos retroativos.")
+                    st.error(f"⛔ O mês {data_mov.strftime('%m/%Y')} já foi FECHADO.")
                 elif (evento_sel == "Entrada/Nascimento" or evento_sel in EVENTOS_SAIDA) and not obs:
                     st.error("Para este evento, o campo observação é obrigatório.")
                 else:
                     pode_gravar = True
                     if evento_sel in EVENTOS_SAIDA or evento_sel == "Transferências/Para Outras Categorias":
-                        saldo_atual = get_saldo_atual(conn, id_f, cat_sel)
                         if saldo_atual < qtd:
-                            st.error(f"Saldo insuficiente! Estoque de {cat_sel}: {saldo_atual} cab.")
+                            st.error(f"Saldo insuficiente! Estoque de {cat_sel}: {fmt_cab(saldo_atual)}")
                             pode_gravar = False
 
                     if pode_gravar:
                         try:
                             if evento_sel == "Transferências/Para Outras Categorias":
-                                cat_destino = fluxo_transferencia.get(cat_sel)
-                                if not cat_destino:
-                                    st.error(f"A categoria '{cat_sel}' não possui destino definido no fluxo.")
+                                if not cat_destino_sel:
+                                    st.error("Selecione o destino da transferência antes de confirmar.")
                                 else:
+                                    saldo_origem_antes  = get_saldo_atual(conn, id_f, cat_sel)
+                                    saldo_destino_antes = get_saldo_atual(conn, id_f, cat_destino_sel)
+
                                     sql_sai = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
-                                    conn.execute(sql_sai, {"d": data_mov, "f": id_f, "q": qtd,
-                                                           "e": "Transferências/Para Outras Categorias",
-                                                           "c": cat_sel,
-                                                           "o": f"Saída p/ {cat_destino}. Obs: {obs}"})
+                                    conn.execute(sql_sai, {
+                                        "d": data_mov, "f": id_f, "q": qtd,
+                                        "e": "Transferências/Para Outras Categorias",
+                                        "c": cat_sel,
+                                        "o": f"Saída p/ {cat_destino_sel}. Obs: {obs}"
+                                    })
                                     sql_ent = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
-                                    conn.execute(sql_ent, {"d": data_mov, "f": id_f, "q": qtd,
-                                                           "e": "Transferências/De Outras Categorias",
-                                                           "c": cat_destino,
-                                                           "o": f"Entrada vinda de {cat_sel}. Obs: {obs}"})
+                                    conn.execute(sql_ent, {
+                                        "d": data_mov, "f": id_f, "q": qtd,
+                                        "e": "Transferências/De Outras Categorias",
+                                        "c": cat_destino_sel,
+                                        "o": f"Entrada vinda de {cat_sel}. Obs: {obs}"
+                                    })
                                     conn.commit()
-                                    st.success(f"Transferência concluída! {qtd} cab. saíram de {cat_sel} e entraram em {cat_destino}.")
+
+                                    # Limpa escolha de destino
+                                    if "cat_destino_escolhido" in st.session_state:
+                                        del st.session_state["cat_destino_escolhido"]
+
+                                    # --- HISTÓRICO VISUAL ANTES/DEPOIS ---
+                                    saldo_origem_depois  = get_saldo_atual(conn, id_f, cat_sel)
+                                    saldo_destino_depois = get_saldo_atual(conn, id_f, cat_destino_sel)
+
+                                    st.success(f"✅ Transferência concluída! {fmt_cab(qtd)} movidas.")
                                     st.balloons()
+
+                                    col_a, col_b = st.columns(2)
+                                    with col_a:
+                                        st.markdown("**📤 Origem**")
+                                        st.metric(
+                                            cat_sel,
+                                            fmt_cab(saldo_origem_depois),
+                                            delta=f"−{fmt_br(qtd)} cab.",
+                                            delta_color="inverse"
+                                        )
+                                    with col_b:
+                                        st.markdown("**📥 Destino**")
+                                        st.metric(
+                                            cat_destino_sel,
+                                            fmt_cab(saldo_destino_depois),
+                                            delta=f"+{fmt_br(qtd)} cab.",
+                                            delta_color="normal"
+                                        )
                             else:
                                 sql = text("INSERT INTO lanc_estoque (data_movimento, id_fazenda, quantidade, evento, categoria, observacao) VALUES (:d, :f, :q, :e, :c, :o)")
-                                conn.execute(sql, {"d": data_mov, "f": id_f, "q": qtd,
-                                                   "e": evento_sel, "c": cat_sel, "o": obs})
+                                conn.execute(sql, {
+                                    "d": data_mov, "f": id_f, "q": qtd,
+                                    "e": evento_sel, "c": cat_sel, "o": obs
+                                })
                                 conn.commit()
-                                st.success(f"Sucesso! {qtd} '{cat_sel}' registrado como '{evento_sel}'.")
+                                st.success(f"✅ {fmt_cab(qtd)} de '{cat_sel}' registrado como '{evento_sel}'.")
                                 st.balloons()
                         except Exception as e:
                             st.error(f"Erro no banco: {e}")
@@ -206,17 +343,10 @@ else:
 
         st.sidebar.divider()
         st.sidebar.subheader("Período do Dashboard")
-        hoje = date.today()
+        hoje  = date.today()
         d_ini = st.sidebar.date_input("Data Inicial", date(hoje.year, hoje.month, 1))
         d_fim = st.sidebar.date_input("Data Final", hoje)
 
-        # --------------------------------------------------------
-        # IMPORTANTE: O saldo do balanço é ACUMULADO HISTÓRICO
-        # até d_fim (ignora d_ini intencionalmente).
-        # d_ini é usado apenas no histórico de lançamentos abaixo.
-        # O Módulo de Auditoria (menu separado) mostra o filtro
-        # por período com saldo inicial + movimentações.
-        # --------------------------------------------------------
         st.info(
             f"ℹ️ **Saldo acumulado histórico até {d_fim.strftime('%d/%m/%Y')}** "
             f"(todo o histórico desde o início). "
@@ -233,18 +363,18 @@ else:
         df_bal = pd.read_sql(q_balanco, conn, params={"f": d_fim})
 
         if not df_bal.empty:
-            df_p = pd.read_sql(text("SELECT * FROM precos_gestao"), conn)
-            dict_p = dict(zip(df_p['categoria'], df_p['valor']))
+            df_p    = pd.read_sql(text("SELECT * FROM precos_gestao"), conn)
+            dict_p  = dict(zip(df_p['categoria'], df_p['valor']))
             df_bal['Preço Unit.'] = df_bal['Categoria'].map(dict_p).fillna(0)
-            df_bal['Total R$'] = df_bal['Estoque'] * df_bal['Preço Unit.']
-            df_bal = df_bal[df_bal['Estoque'] > 0]  # Remove categorias zeradas
+            df_bal['Total R$']   = df_bal['Estoque'] * df_bal['Preço Unit.']
+            df_bal = df_bal[df_bal['Estoque'] > 0]
 
             total_r = df_bal['Total R$'].sum()
             total_c = df_bal['Estoque'].sum()
             m1, m2, m3 = st.columns(3)
-            m1.metric("Estoque Total", f"{int(total_c)} cab.")
-            m2.metric("Valorização Total", f"R$ {total_r:,.2f}")
-            m3.metric("Média por Animal", f"R$ {(total_r / total_c if total_c > 0 else 0):,.2f}")
+            m1.metric("Estoque Total",    fmt_cab(total_c))
+            m2.metric("Valorização Total", fmt_brl(total_r))
+            m3.metric("Média por Animal",  fmt_brl(total_r / total_c if total_c > 0 else 0))
 
             st.divider()
             col_g, col_t = st.columns([1, 1.2])
@@ -255,10 +385,13 @@ else:
                 st.plotly_chart(fig, use_container_width=True)
             with col_t:
                 st.subheader("Tabela de Participação")
-                st.dataframe(
-                    df_bal.style.format({'Preço Unit.': 'R$ {:.2f}', 'Total R$': 'R$ {:.2f}'}),
-                    use_container_width=True, hide_index=True
-                )
+                # Aplica formatação BR nas colunas numéricas
+                df_bal_fmt = df_bal.copy()
+                df_bal_fmt['Estoque']     = df_bal_fmt['Estoque'].apply(lambda v: fmt_br(v))
+                df_bal_fmt['Preço Unit.'] = df_bal_fmt['Preço Unit.'].apply(fmt_brl)
+                df_bal_fmt['Total R$']    = df_bal_fmt['Total R$'].apply(fmt_brl)
+                st.dataframe(df_bal_fmt, use_container_width=True, hide_index=True)
+
                 c_ex1, c_ex2 = st.columns(2)
                 with c_ex1:
                     buf = io.BytesIO()
@@ -266,11 +399,12 @@ else:
                     st.download_button("📥 Excel", buf.getvalue(), "balanco.xlsx")
                 with c_ex2:
                     pdf_buf = io.BytesIO()
-                    canv = canvas.Canvas(pdf_buf, pagesize=letter)
+                    canv    = canvas.Canvas(pdf_buf, pagesize=letter)
                     canv.drawString(50, 750, f"AJAGRO - BALANÇO EM {d_fim.strftime('%d/%m/%Y')}")
                     y = 720
                     for _, row in df_bal.iterrows():
-                        canv.drawString(50, y, f"{row['Categoria']}: {row['Estoque']} cab. - R$ {row['Total R$']:,.2f}")
+                        canv.drawString(50, y,
+                            f"{row['Categoria']}: {fmt_cab(row['Estoque'])} - {fmt_brl(row['Total R$'])}")
                         y -= 20
                     canv.save()
                     st.download_button("📥 PDF", pdf_buf.getvalue(), "balanco.pdf")
@@ -278,11 +412,13 @@ else:
             st.divider()
             st.subheader("📑 Últimos Lançamentos")
             df_hist = pd.read_sql(text("""
-                SELECT TO_CHAR(data_movimento,'DD/MM/YYYY') as Data,
-                       evento as Evento, categoria as Categoria,
-                       quantidade as Quantidade
+                SELECT TO_CHAR(data_movimento,'DD/MM/YYYY') as "Data",
+                       evento as "Evento", categoria as "Categoria",
+                       quantidade as "Quantidade"
                 FROM lanc_estoque ORDER BY id_lancamento DESC LIMIT 20
             """), conn)
+            # Formata quantidade
+            df_hist["Quantidade"] = df_hist["Quantidade"].apply(lambda v: fmt_br(v))
             st.table(df_hist)
         else:
             st.warning("Nenhum lançamento encontrado até a data selecionada.")
@@ -290,65 +426,51 @@ else:
         conn.close()
 
     # =========================================================
-    # NOVA TELA v3.2: MÓDULO DE AUDITORIA
-    # =========================================================
-    # LÓGICA DE SALDO:
-    #   Saldo Inicial  = acumulado de TODOS os lançamentos ANTES de d_ini
-    #   Movimentações  = lançamentos DENTRO do período [d_ini, d_fim]
-    #   Saldo Final    = Saldo Inicial + Entradas do período - Saídas do período
-    #
-    # Isso separa claramente "o que eu tinha antes" de "o que movimentei agora",
-    # corrigindo a confusão entre Saldo Acumulado Histórico e Filtro de Período.
+    # TELA: MÓDULO DE AUDITORIA
     # =========================================================
     elif menu == "📋 Módulo de Auditoria":
         st.header("📋 Módulo de Auditoria — Extrato de Movimentações")
 
-        conn = get_connection()
+        conn     = get_connection()
         fazendas = pd.read_sql(text("SELECT id_fazenda, nome_fazenda FROM fazendas"), conn)
 
         st.sidebar.divider()
         st.sidebar.subheader("Filtros da Auditoria")
-        hoje = date.today()
+        hoje  = date.today()
         d_ini = st.sidebar.date_input("Data Inicial", date(hoje.year, hoje.month, 1), key="aud_ini")
         d_fim = st.sidebar.date_input("Data Final", hoje, key="aud_fim")
 
         faz_opcoes = ["Todas as Fazendas"] + fazendas['nome_fazenda'].tolist()
-        faz_sel = st.sidebar.selectbox("Fazenda", faz_opcoes, key="aud_faz")
+        faz_sel    = st.sidebar.selectbox("Fazenda",   faz_opcoes,      key="aud_faz")
         cat_opcoes = ["Todas as Categorias"] + CATEGORIAS_LISTA
-        cat_sel = st.sidebar.selectbox("Categoria", cat_opcoes, key="aud_cat")
+        cat_sel    = st.sidebar.selectbox("Categoria", cat_opcoes,      key="aud_cat")
 
-        # Monta filtros dinâmicos
         filtro_faz_sql = ""
         filtro_cat_sql = ""
-        params_base = {"d_ini": d_ini, "d_fim": d_fim}
+        params_base    = {"d_ini": d_ini, "d_fim": d_fim}
 
         if faz_sel != "Todas as Fazendas":
             id_faz = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
-            filtro_faz_sql = "AND id_fazenda = :id_faz"
+            filtro_faz_sql       = "AND id_fazenda = :id_faz"
             params_base["id_faz"] = id_faz
 
         if cat_sel != "Todas as Categorias":
-            filtro_cat_sql = "AND categoria = :cat"
+            filtro_cat_sql    = "AND categoria = :cat"
             params_base["cat"] = cat_sel
 
-        # --------------------------------------------------------
-        # SEÇÃO 1: SALDO INICIAL (tudo antes de d_ini)
-        # --------------------------------------------------------
+        # Saldo inicial
         q_saldo_ini = text(f"""
             SELECT categoria,
                    SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
                             THEN quantidade ELSE -quantidade END) as saldo_inicial
             FROM lanc_estoque
             WHERE data_movimento < :d_ini
-            {filtro_faz_sql}
-            {filtro_cat_sql}
+            {filtro_faz_sql} {filtro_cat_sql}
             GROUP BY categoria
         """)
         df_saldo_ini = pd.read_sql(q_saldo_ini, conn, params=params_base)
 
-        # --------------------------------------------------------
-        # SEÇÃO 2: MOVIMENTAÇÕES DO PERÍODO [d_ini, d_fim]
-        # --------------------------------------------------------
+        # Movimentações do período
         q_mov = text(f"""
             SELECT categoria,
                    SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
@@ -357,29 +479,22 @@ else:
                             THEN quantidade ELSE 0 END) as saidas
             FROM lanc_estoque
             WHERE data_movimento BETWEEN :d_ini AND :d_fim
-            {filtro_faz_sql}
-            {filtro_cat_sql}
+            {filtro_faz_sql} {filtro_cat_sql}
             GROUP BY categoria
         """)
         df_mov = pd.read_sql(q_mov, conn, params=params_base)
 
-        # --------------------------------------------------------
-        # SEÇÃO 3: MONTA TABELA DE SALDO CONSOLIDADO
-        # --------------------------------------------------------
+        # Consolidado
         todas_cats = pd.DataFrame({'categoria': CATEGORIAS_LISTA if cat_sel == "Todas as Categorias" else [cat_sel]})
-        df_cons = todas_cats.merge(df_saldo_ini, on='categoria', how='left')
-        df_cons = df_cons.merge(df_mov, on='categoria', how='left')
-        df_cons = df_cons.fillna(0)
+        df_cons    = todas_cats.merge(df_saldo_ini, on='categoria', how='left')
+        df_cons    = df_cons.merge(df_mov, on='categoria', how='left')
+        df_cons    = df_cons.fillna(0)
         df_cons['saldo_final'] = df_cons['saldo_inicial'] + df_cons['entradas'] - df_cons['saidas']
-
-        # Remove categorias sem nenhuma movimentação histórica
         df_cons = df_cons[(df_cons['saldo_inicial'] != 0) |
                           (df_cons['entradas'] != 0) |
                           (df_cons['saidas'] != 0)]
 
-        # --------------------------------------------------------
-        # SEÇÃO 4: KPIs DO PERÍODO
-        # --------------------------------------------------------
+        # KPIs
         total_ini = int(df_cons['saldo_inicial'].sum())
         total_ent = int(df_cons['entradas'].sum())
         total_sai = int(df_cons['saidas'].sum())
@@ -387,17 +502,15 @@ else:
 
         st.subheader(f"Resumo do Período: {d_ini.strftime('%d/%m/%Y')} → {d_fim.strftime('%d/%m/%Y')}")
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Saldo Inicial", f"{total_ini} cab.", help="Acumulado histórico antes do período")
-        k2.metric("Entradas no Período", f"+ {total_ent} cab.")
-        k3.metric("Saídas no Período",   f"- {total_sai} cab.")
-        k4.metric("Saldo Final",         f"{total_fim} cab.",
-                  delta=f"{total_fim - total_ini:+d} cab.")
+        k1.metric("Saldo Inicial",       fmt_cab(total_ini), help="Acumulado histórico antes do período")
+        k2.metric("Entradas no Período", f"+ {fmt_br(total_ent)} cab.")
+        k3.metric("Saídas no Período",   f"- {fmt_br(total_sai)} cab.")
+        k4.metric("Saldo Final",         fmt_cab(total_fim),
+                  delta=f"{total_fim - total_ini:+,.0f} cab.".replace(",", "."))
 
         st.divider()
 
-        # --------------------------------------------------------
-        # SEÇÃO 5: TABELA DE SALDO POR CATEGORIA
-        # --------------------------------------------------------
+        # Tabela por categoria — formatação BR
         st.subheader("📊 Saldo por Categoria")
         df_display = df_cons.rename(columns={
             'categoria':     'Categoria',
@@ -408,44 +521,48 @@ else:
         })
 
         def highlight_saldo(val):
-            if val < 0:
+            if isinstance(val, (int, float)) and val < 0:
                 return 'color: red; font-weight: bold'
             return ''
+
+        # Cria cópia formatada para exibição
+        df_display_fmt = df_display.copy()
+        for col in ['Saldo Inicial', 'Entradas', 'Saídas', 'Saldo Final']:
+            df_display_fmt[col] = df_display_fmt[col].apply(lambda v: fmt_br(v))
 
         st.dataframe(
             df_display.style
                 .map(highlight_saldo, subset=['Saldo Final'])
-                .format({'Saldo Inicial': '{:.0f}', 'Entradas': '{:.0f}',
-                         'Saídas': '{:.0f}', 'Saldo Final': '{:.0f}'}),
+                .format({
+                    'Saldo Inicial': lambda v: fmt_br(v),
+                    'Entradas':      lambda v: fmt_br(v),
+                    'Saídas':        lambda v: fmt_br(v),
+                    'Saldo Final':   lambda v: fmt_br(v),
+                }),
             use_container_width=True,
             hide_index=True
         )
 
         st.divider()
 
-        # --------------------------------------------------------
-        # SEÇÃO 6: GRÁFICO — Entradas vs Saídas por Categoria
-        # --------------------------------------------------------
+        # Gráfico
         st.subheader("📈 Movimentações do Período por Categoria")
         df_graf = df_cons[df_cons['entradas'] + df_cons['saidas'] > 0]
         if not df_graf.empty:
             fig_bar = go.Figure()
             fig_bar.add_trace(go.Bar(name='Entradas', x=df_graf['categoria'],
                                      y=df_graf['entradas'], marker_color='#2ecc71'))
-            fig_bar.add_trace(go.Bar(name='Saídas', x=df_graf['categoria'],
-                                     y=df_graf['saidas'], marker_color='#e74c3c'))
+            fig_bar.add_trace(go.Bar(name='Saídas',   x=df_graf['categoria'],
+                                     y=df_graf['saidas'],   marker_color='#e74c3c'))
             fig_bar.update_layout(barmode='group', xaxis_tickangle=-30,
-                                  legend=dict(orientation="h"),
-                                  margin=dict(b=80))
+                                  legend=dict(orientation="h"), margin=dict(b=80))
             st.plotly_chart(fig_bar, use_container_width=True)
         else:
             st.info("Nenhuma movimentação registrada neste período para os filtros selecionados.")
 
         st.divider()
 
-        # --------------------------------------------------------
-        # SEÇÃO 7: EXTRATO DETALHADO (linha a linha)
-        # --------------------------------------------------------
+        # Extrato detalhado
         st.subheader("📑 Extrato Detalhado de Lançamentos")
         q_extrato = text(f"""
             SELECT
@@ -462,16 +579,18 @@ else:
             FROM lanc_estoque l
             JOIN fazendas f ON f.id_fazenda = l.id_fazenda
             WHERE l.data_movimento BETWEEN :d_ini AND :d_fim
-            {filtro_faz_sql}
-            {filtro_cat_sql}
+            {filtro_faz_sql} {filtro_cat_sql}
             ORDER BY l.data_movimento ASC, l.id_lancamento ASC
         """)
         df_extrato = pd.read_sql(q_extrato, conn, params=params_base)
 
         if not df_extrato.empty:
-            st.dataframe(df_extrato, use_container_width=True, hide_index=True)
+            # Formata colunas numéricas no extrato
+            df_extrato_fmt = df_extrato.copy()
+            for col in ["Qtd", "Entrada (+)", "Saída (-)"]:
+                df_extrato_fmt[col] = df_extrato_fmt[col].apply(lambda v: fmt_br(v))
+            st.dataframe(df_extrato_fmt, use_container_width=True, hide_index=True)
 
-            # ---- EXPORTAÇÕES ----
             col_exp1, col_exp2 = st.columns(2)
             with col_exp1:
                 buf_xls = io.BytesIO()
@@ -482,35 +601,26 @@ else:
                                    buf_xls.getvalue(), "auditoria.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             with col_exp2:
-                # PDF de Auditoria com ReportLab
                 pdf_buf = io.BytesIO()
-                doc = SimpleDocTemplate(pdf_buf, pagesize=A4,
-                                        leftMargin=30, rightMargin=30,
-                                        topMargin=40, bottomMargin=30)
-                styles = getSampleStyleSheet()
+                doc     = SimpleDocTemplate(pdf_buf, pagesize=A4,
+                                            leftMargin=30, rightMargin=30,
+                                            topMargin=40, bottomMargin=30)
+                styles   = getSampleStyleSheet()
                 elements = []
-
-                elements.append(Paragraph(
-                    f"AJAGRO — Extrato de Auditoria",
-                    styles['Title']
-                ))
+                elements.append(Paragraph("AJAGRO — Extrato de Auditoria", styles['Title']))
                 elements.append(Paragraph(
                     f"Período: {d_ini.strftime('%d/%m/%Y')} a {d_fim.strftime('%d/%m/%Y')} | "
-                    f"Fazenda: {faz_sel} | Categoria: {cat_sel}",
-                    styles['Normal']
-                ))
+                    f"Fazenda: {faz_sel} | Categoria: {cat_sel}", styles['Normal']))
                 elements.append(Spacer(1, 12))
-
-                # Tabela de saldo
                 elements.append(Paragraph("Saldo por Categoria", styles['Heading2']))
                 data_tab = [['Categoria', 'Saldo Ini.', 'Entradas', 'Saídas', 'Saldo Final']]
                 for _, row in df_cons.iterrows():
                     data_tab.append([
                         row['categoria'],
-                        str(int(row['saldo_inicial'])),
-                        str(int(row['entradas'])),
-                        str(int(row['saidas'])),
-                        str(int(row['saldo_final']))
+                        fmt_br(row['saldo_inicial']),
+                        fmt_br(row['entradas']),
+                        fmt_br(row['saidas']),
+                        fmt_br(row['saldo_final'])
                     ])
                 t = Table(data_tab, hAlign='LEFT')
                 t.setStyle(TableStyle([
@@ -522,18 +632,17 @@ else:
                 ]))
                 elements.append(t)
                 elements.append(Spacer(1, 16))
-
-                # Extrato detalhado
                 elements.append(Paragraph("Extrato Detalhado", styles['Heading2']))
                 cols_pdf = ['Data', 'Fazenda', 'Categoria', 'Evento', 'Entrada (+)', 'Saída (-)']
                 data_ext = [cols_pdf]
                 for _, row in df_extrato.iterrows():
                     data_ext.append([
                         row['Data'], row['Fazenda'], row['Categoria'],
-                        row['Evento'][:30], str(int(row['Entrada (+)'])), str(int(row['Saída (-)']))
+                        row['Evento'][:30],
+                        fmt_br(row['Entrada (+)']),
+                        fmt_br(row['Saída (-)'])
                     ])
-                t2 = Table(data_ext, hAlign='LEFT',
-                           colWidths=[50, 70, 90, 130, 50, 50])
+                t2 = Table(data_ext, hAlign='LEFT', colWidths=[50, 70, 90, 130, 50, 50])
                 t2.setStyle(TableStyle([
                     ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#27ae60')),
                     ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
@@ -568,96 +677,57 @@ else:
                 st.success("Fazenda cadastrada!")
 
     # =========================================================
-    # NOVA TELA v3.2: KPIs ZOOTÉCNICOS (SEMÁFORO)
-    # =========================================================
-    # MAPEAMENTO DE CATEGORIAS → GRUPOS DE KPI:
-    #
-    #   Bezerros (0-60 dias) → "Mamando - Machos" + "Mamando - Fêmeas"
-    #   Recria (2-12 meses)  → "Novilhas até 1 ano"
-    #   Novilhas (>12 meses) → "Novilhas de 1 a 2 anos" + "Novilhas Prenhas"
-    #   Vacas Adultas        → "Vacas Lactantes" + "Vacas Secas" +
-    #                          "Vacas a refugar" + "Vacas refugadas"
-    #
-    # DENOMINADOR: Total do período = Saldo Inicial + Entradas do período
-    # ÓBITOS:      evento = 'Saída/Mortes' dentro do período filtrado
-    #
-    # SEMÁFORO (conforme especificação do cliente):
-    #   Verde    = dentro da meta ideal
-    #   Amarelo  = aceitável (atenção)
-    #   Vermelho = crítico (alerta imediato)
+    # TELA: KPIs ZOOTÉCNICOS
     # =========================================================
     elif menu == "📊 KPIs Zootécnicos":
         st.header("📊 KPIs Zootécnicos — Painel de Indicadores")
 
-        conn = get_connection()
+        conn     = get_connection()
         fazendas = pd.read_sql(text("SELECT id_fazenda, nome_fazenda FROM fazendas"), conn)
 
         st.sidebar.divider()
         st.sidebar.subheader("Filtros dos KPIs")
-        hoje = date.today()
+        hoje  = date.today()
         d_ini = st.sidebar.date_input("Data Inicial", date(hoje.year, hoje.month, 1), key="kpi_ini")
         d_fim = st.sidebar.date_input("Data Final", hoje, key="kpi_fim")
         faz_opcoes = ["Todas as Fazendas"] + fazendas['nome_fazenda'].tolist()
-        faz_sel = st.sidebar.selectbox("Fazenda", faz_opcoes, key="kpi_faz")
+        faz_sel    = st.sidebar.selectbox("Fazenda", faz_opcoes, key="kpi_faz")
 
-        # Monta filtro de fazenda
         filtro_faz = ""
-        params = {"d_ini": d_ini, "d_fim": d_fim}
+        params     = {"d_ini": d_ini, "d_fim": d_fim}
         if faz_sel != "Todas as Fazendas":
             id_faz = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
-            filtro_faz = "AND id_fazenda = :id_faz"
+            filtro_faz       = "AND id_fazenda = :id_faz"
             params["id_faz"] = id_faz
 
-        # ----------------------------------------------------------
-        # FUNÇÃO AUXILIAR: calcula óbitos e população de um grupo
-        # ----------------------------------------------------------
-        def calc_kpi_grupo(conn, categorias: list, params: dict, filtro_faz: str):
+        def calc_kpi_grupo(conn, categorias, params, filtro_faz):
             cats_sql = ", ".join([f"'{c}'" for c in categorias])
-
-            # Óbitos no período
             q_obitos = text(f"""
-                SELECT COALESCE(SUM(quantidade), 0)
-                FROM lanc_estoque
-                WHERE evento = 'Saída/Mortes'
-                  AND categoria IN ({cats_sql})
-                  AND data_movimento BETWEEN :d_ini AND :d_fim
-                  {filtro_faz}
+                SELECT COALESCE(SUM(quantidade), 0) FROM lanc_estoque
+                WHERE evento = 'Saída/Mortes' AND categoria IN ({cats_sql})
+                  AND data_movimento BETWEEN :d_ini AND :d_fim {filtro_faz}
             """)
             obitos = conn.execute(q_obitos, params).scalar() or 0
-
-            # Saldo inicial (acumulado antes de d_ini)
             q_saldo_ini = text(f"""
                 SELECT COALESCE(SUM(
                     CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
-                         THEN quantidade ELSE -quantidade END
-                ), 0)
+                         THEN quantidade ELSE -quantidade END), 0)
                 FROM lanc_estoque
-                WHERE categoria IN ({cats_sql})
-                  AND data_movimento < :d_ini
-                  {filtro_faz}
+                WHERE categoria IN ({cats_sql}) AND data_movimento < :d_ini {filtro_faz}
             """)
             saldo_ini = conn.execute(q_saldo_ini, params).scalar() or 0
-
-            # Entradas no período
             q_entradas = text(f"""
-                SELECT COALESCE(SUM(quantidade), 0)
-                FROM lanc_estoque
+                SELECT COALESCE(SUM(quantidade), 0) FROM lanc_estoque
                 WHERE (evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%')
                   AND categoria IN ({cats_sql})
-                  AND data_movimento BETWEEN :d_ini AND :d_fim
-                  {filtro_faz}
+                  AND data_movimento BETWEEN :d_ini AND :d_fim {filtro_faz}
             """)
-            entradas = conn.execute(q_entradas, params).scalar() or 0
-
+            entradas  = conn.execute(q_entradas, params).scalar() or 0
             populacao = saldo_ini + entradas
-            taxa = (obitos / populacao * 100) if populacao > 0 else 0.0
+            taxa      = (obitos / populacao * 100) if populacao > 0 else 0.0
             return int(obitos), int(populacao), round(taxa, 2)
 
-        # ----------------------------------------------------------
-        # FUNÇÃO DO SEMÁFORO
-        # ----------------------------------------------------------
         def semaforo(taxa, verde_max, amarelo_max):
-            """Retorna (emoji, cor_hex, label) conforme os limites."""
             if taxa < verde_max:
                 return "🟢", "#27ae60", "IDEAL"
             elif taxa <= amarelo_max:
@@ -665,9 +735,6 @@ else:
             else:
                 return "🔴", "#e74c3c", "CRÍTICO"
 
-        # ----------------------------------------------------------
-        # CÁLCULO DOS 4 KPIs DE MORTALIDADE
-        # ----------------------------------------------------------
         grupos_mortalidade = {
             "Bezerros (0–60 dias)": {
                 "categorias": ["Mamando - Machos", "Mamando - Fêmeas"],
@@ -695,8 +762,7 @@ else:
         st.subheader(f"🚦 Taxas de Mortalidade — {d_ini.strftime('%d/%m/%Y')} a {d_fim.strftime('%d/%m/%Y')}")
         st.caption(f"Fazenda: **{faz_sel}** | Denominador: Saldo Inicial + Entradas do período")
 
-        # Grade 2x2 para os cards de mortalidade
-        col_pares = [st.columns(2), st.columns(2)]
+        col_pares  = [st.columns(2), st.columns(2)]
         kpi_results = []
         for idx, (nome, cfg) in enumerate(grupos_mortalidade.items()):
             obitos, pop, taxa = calc_kpi_grupo(conn, cfg["categorias"], params, filtro_faz)
@@ -713,9 +779,9 @@ else:
                 <div style="border:2px solid {cor}; border-radius:12px; padding:16px;
                             background:{'#f9fbe7' if cor=='#f39c12' else ('#fdecea' if cor=='#e74c3c' else '#f0faf4')};">
                     <div style="font-size:1.1rem; font-weight:700; color:#2c3e50;">{emoji} {nome}</div>
-                    <div style="font-size:2.4rem; font-weight:900; color:{cor};">{taxa:.2f}%</div>
+                    <div style="font-size:2.4rem; font-weight:900; color:{cor};">{fmt_br(taxa, 2)}%</div>
                     <div style="font-size:0.85rem; color:#555;">
-                        {obitos} óbitos / {pop} animais no período
+                        {fmt_br(obitos)} óbitos / {fmt_br(pop)} animais no período
                     </div>
                     <div style="margin-top:6px;">
                         <span style="background:{cor}; color:white; padding:2px 10px;
@@ -725,41 +791,34 @@ else:
                     </div>
                     <div style="font-size:0.78rem; color:#777; margin-top:8px;">{cfg['descricao']}</div>
                     <div style="font-size:0.75rem; color:#aaa; margin-top:4px;">
-                        Meta: &lt;{cfg['verde_max']}% ✅ | Atenção: até {cfg['amarelo_max']}% ⚠️
+                        Meta: &lt;{fmt_br(cfg['verde_max'], 1)}% ✅ | Atenção: até {fmt_br(cfg['amarelo_max'], 1)}% ⚠️
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
 
         st.divider()
-
-        # ----------------------------------------------------------
-        # KPIs DE COMPOSIÇÃO DO REBANHO
-        # ----------------------------------------------------------
         st.subheader("🐄 Composição e Eficiência do Rebanho")
 
-        # Busca saldo acumulado até d_fim por categoria
         q_saldo = text(f"""
             SELECT categoria,
                    SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
                             THEN quantidade ELSE -quantidade END) as saldo
             FROM lanc_estoque
-            WHERE data_movimento <= :d_fim
-            {filtro_faz}
+            WHERE data_movimento <= :d_fim {filtro_faz}
             GROUP BY categoria
         """)
-        df_saldo = pd.read_sql(q_saldo, conn, params={"d_fim": d_fim, **({
+        df_saldo   = pd.read_sql(q_saldo, conn, params={"d_fim": d_fim, **({
             "id_faz": params["id_faz"]} if "id_faz" in params else {})})
         saldo_dict = dict(zip(df_saldo['categoria'], df_saldo['saldo'].clip(lower=0)))
 
-        lactantes  = saldo_dict.get("Vacas Lactantes", 0)
-        secas      = saldo_dict.get("Vacas Secas", 0)
+        lactantes     = saldo_dict.get("Vacas Lactantes", 0)
+        secas         = saldo_dict.get("Vacas Secas", 0)
         total_rebanho = sum(v for v in saldo_dict.values() if v > 0)
-        total_vacas = lactantes + secas
+        total_vacas   = lactantes + secas
 
-        pct_lact_vacas    = (lactantes / total_vacas * 100)    if total_vacas > 0    else 0.0
-        pct_lact_rebanho  = (lactantes / total_rebanho * 100)  if total_rebanho > 0  else 0.0
+        pct_lact_vacas   = (lactantes / total_vacas   * 100) if total_vacas   > 0 else 0.0
+        pct_lact_rebanho = (lactantes / total_rebanho * 100) if total_rebanho > 0 else 0.0
 
-        # Semáforos de composição (metas invertidas: abaixo é pior)
         def semaforo_comp(valor, verde_min, amarelo_min):
             if valor >= verde_min:
                 return "🟢", "#27ae60", "IDEAL"
@@ -776,18 +835,18 @@ else:
             (c1, em1, cor1, lb1,
              "% Lactantes / Total de Vacas", pct_lact_vacas,
              "≥ 83%", "75% a 82%",
-             f"Lactantes: {int(lactantes)} | Secas: {int(secas)} | Total Vacas: {int(total_vacas)}"),
+             f"Lactantes: {fmt_br(lactantes)} | Secas: {fmt_br(secas)} | Total Vacas: {fmt_br(total_vacas)}"),
             (c2, em2, cor2, lb2,
              "% Lactantes / Rebanho Total", pct_lact_rebanho,
              "≥ 55%", "50% a 54%",
-             f"Lactantes: {int(lactantes)} | Rebanho Total: {int(total_rebanho)} animais"),
+             f"Lactantes: {fmt_br(lactantes)} | Rebanho Total: {fmt_br(total_rebanho)} animais"),
         ]:
             with col:
                 st.markdown(f"""
                 <div style="border:2px solid {cor}; border-radius:12px; padding:16px;
                             background:{'#f9fbe7' if cor=='#f39c12' else ('#fdecea' if cor=='#e74c3c' else '#f0faf4')};">
                     <div style="font-size:1.1rem; font-weight:700; color:#2c3e50;">{emoji} {titulo}</div>
-                    <div style="font-size:2.4rem; font-weight:900; color:{cor};">{valor:.1f}%</div>
+                    <div style="font-size:2.4rem; font-weight:900; color:{cor};">{fmt_br(valor, 1)}%</div>
                     <div style="font-size:0.85rem; color:#555;">{descricao}</div>
                     <div style="margin-top:6px;">
                         <span style="background:{cor}; color:white; padding:2px 10px;
@@ -802,44 +861,39 @@ else:
                 """, unsafe_allow_html=True)
 
         st.divider()
-
-        # ----------------------------------------------------------
-        # TABELA RESUMO DOS KPIs
-        # ----------------------------------------------------------
         st.subheader("📋 Tabela Resumo — Todos os Indicadores")
         rows = []
         for r in kpi_results:
             rows.append({
-                "Indicador":   r["nome"],
-                "Óbitos":      r["obitos"],
-                "População":   r["pop"],
-                "Taxa (%)":    r["taxa"],
-                "Status":      f"{r['emoji']} {r['label']}",
-                "Meta Verde":  f"< {r['verde_max']}%",
-                "Limite Crítico": f"> {r['amarelo_max']}%",
+                "Indicador":      r["nome"],
+                "Óbitos":         fmt_br(r["obitos"]),
+                "População":      fmt_br(r["pop"]),
+                "Taxa (%)":       fmt_br(r["taxa"], 2),
+                "Status":         f"{r['emoji']} {r['label']}",
+                "Meta Verde":     f"< {fmt_br(r['verde_max'], 1)}%",
+                "Limite Crítico": f"> {fmt_br(r['amarelo_max'], 1)}%",
             })
         rows.append({
-            "Indicador":   "% Lactantes / Total Vacas",
-            "Óbitos":      "-",
-            "População":   int(total_vacas),
-            "Taxa (%)":    round(pct_lact_vacas, 2),
-            "Status":      f"{em1} {lb1}",
-            "Meta Verde":  "≥ 83%",
+            "Indicador":      "% Lactantes / Total Vacas",
+            "Óbitos":         "—",
+            "População":      fmt_br(total_vacas),
+            "Taxa (%)":       fmt_br(pct_lact_vacas, 2),
+            "Status":         f"{em1} {lb1}",
+            "Meta Verde":     "≥ 83%",
             "Limite Crítico": "< 75%",
         })
         rows.append({
-            "Indicador":   "% Lactantes / Rebanho Total",
-            "Óbitos":      "-",
-            "População":   int(total_rebanho),
-            "Taxa (%)":    round(pct_lact_rebanho, 2),
-            "Status":      f"{em2} {lb2}",
-            "Meta Verde":  "≥ 55%",
+            "Indicador":      "% Lactantes / Rebanho Total",
+            "Óbitos":         "—",
+            "População":      fmt_br(total_rebanho),
+            "Taxa (%)":       fmt_br(pct_lact_rebanho, 2),
+            "Status":         f"{em2} {lb2}",
+            "Meta Verde":     "≥ 55%",
             "Limite Crítico": "< 50%",
         })
         df_resumo = pd.DataFrame(rows)
         st.dataframe(df_resumo, use_container_width=True, hide_index=True)
 
-        # Exportação Excel
         buf_kpi = io.BytesIO()
         df_resumo.to_excel(buf_kpi, index=False)
         st.download_button("📥 Exportar KPIs (Excel)", buf_kpi.getvalue(),
