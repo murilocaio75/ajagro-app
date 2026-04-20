@@ -22,7 +22,6 @@ def fmt_br(valor, decimais=0):
     if pd.isna(valor):
         return "0"
     fmt = f"{float(valor):,.{decimais}f}"
-    # troca separadores: , -> temp, . -> ,, temp -> .
     return fmt.replace(",", "X").replace(".", ",").replace("X", ".")
 
 def fmt_cab(valor):
@@ -32,9 +31,43 @@ def fmt_brl(valor):
     return f"R$ {fmt_br(valor, 2)}"
 
 # --- CONEXÃO ---
-def get_connection():
+# Engine cacheada: evita criar nova conexão a cada rerun do Streamlit
+@st.cache_resource
+def get_engine():
     db_url = st.secrets["DB_CONN_STRING"].replace("postgres://", "postgresql+psycopg2://", 1)
-    return create_engine(db_url).connect()
+    return create_engine(db_url)
+
+def get_connection():
+    return get_engine().connect()
+
+# --- PARÂMETROS AJAGRO (metas configuráveis via interface) ---
+@st.cache_data(ttl=300)
+def get_parametros():
+    """
+    Retorna dict com todos os parâmetros configuráveis do Supabase.
+    Estrutura: { 'chave': {'verde_max': float, 'amarelo_max': float, 'descricao': str} }
+    Fallback hardcoded garante que o app não quebra se a tabela
+    ainda não existir (útil durante o deploy inicial da v3.3).
+    """
+    FALLBACK = {
+        "mort_bezerros":     {"verde_max": 3.0,  "amarelo_max": 5.0,  "descricao": "Sobrevivência na fase mais crítica da vida."},
+        "mort_recria":       {"verde_max": 3.0,  "amarelo_max": 5.0,  "descricao": "Saúde dos animais em desenvolvimento."},
+        "mort_novilhas":     {"verde_max": 1.0,  "amarelo_max": 2.0,  "descricao": "Fêmeas jovens aptas à reprodução."},
+        "mort_vacas":        {"verde_max": 3.0,  "amarelo_max": 5.0,  "descricao": "Perda do ativo principal gerador de receita."},
+        "comp_lact_vacas":   {"verde_max": 83.0, "amarelo_max": 75.0, "descricao": "% Lactantes / Total de Vacas"},
+        "comp_lact_rebanho": {"verde_max": 55.0, "amarelo_max": 50.0, "descricao": "% Lactantes / Rebanho Total"},
+    }
+    try:
+        conn = get_connection()
+        df = pd.read_sql(text("SELECT chave, verde_max, amarelo_max, descricao FROM parametros_ajagro"), conn)
+        conn.close()
+        return {row["chave"]: {"verde_max": row["verde_max"],
+                               "amarelo_max": row["amarelo_max"],
+                               "descricao": row["descricao"]}
+                for _, row in df.iterrows()}
+    except Exception as e:
+        st.warning(f"⚠️ Tabela parametros_ajagro não encontrada. Usando valores padrão. ({e})")
+        return FALLBACK
 
 # --- CATEGORIAS OFICIAIS ---
 CATEGORIAS_LISTA = [
@@ -58,26 +91,14 @@ EVENTOS_SAIDA = [
 # ==============================================================
 # FLUXO DE TRANSFERÊNCIAS AUTOMÁTICAS v3.3
 # ==============================================================
-# Estrutura: origem -> lista de destinos possíveis
-# Quando há apenas 1 destino, o sistema avança automaticamente.
-# Quando há múltiplos destinos, o usuário escolhe (árvore de decisão).
-#
-# ⏳ PENDENTE: Ajagro irá enviar detalhes dos fluxos de retrocesso
-#    (ex.: Novilha Prenha -> aborto -> Novilhas de 1 a 2 anos)
-#    e demais subcategorias. Estrutura já preparada abaixo.
-# ==============================================================
 FLUXO_TRANSFERENCIA = {
-    # Destino único → avanço automático
-    "Mamando - Machos":      ["Machos"],
-    "Mamando - Fêmeas":      ["Novilhas até 1 ano"],
-    "Novilhas até 1 ano":    ["Novilhas de 1 a 2 anos"],
-    "Novilhas de 1 a 2 anos":["Novilhas Prenhas"],
-
-    # Múltiplos destinos → usuário escolhe (v3.3)
-    "Novilhas Prenhas":      ["Vacas Lactantes", "Vacas a refugar", "Vacas refugadas"],
-    "Vacas Lactantes":       ["Vacas Secas", "Vacas a refugar", "Vacas refugadas"],
-    "Vacas Secas":           ["Vacas Lactantes", "Vacas a refugar", "Vacas refugadas"],
-
+    "Mamando - Machos":       ["Machos"],
+    "Mamando - Fêmeas":       ["Novilhas até 1 ano"],
+    "Novilhas até 1 ano":     ["Novilhas de 1 a 2 anos"],
+    "Novilhas de 1 a 2 anos": ["Novilhas Prenhas"],
+    "Novilhas Prenhas":       ["Vacas Lactantes", "Vacas a refugar", "Vacas refugadas"],
+    "Vacas Lactantes":        ["Vacas Secas", "Vacas a refugar", "Vacas refugadas"],
+    "Vacas Secas":            ["Vacas Lactantes", "Vacas a refugar", "Vacas refugadas"],
     # ⏳ Fluxos de retrocesso — aguardando detalhes da Ajagro
     # "Novilhas Prenhas": += ["Novilhas de 1 a 2 anos"],  # aborto
 }
@@ -114,7 +135,8 @@ def is_mes_fechado(conn, data_mov):
     try:
         res = conn.execute(query, {"d": primeiro_dia}).fetchone()
         return res is not None
-    except:
+    except Exception as e:
+        st.warning(f"Aviso ao verificar fechamento mensal: {e}")
         return False
 
 # --- LOGIN ---
@@ -144,6 +166,7 @@ else:
         "Lançamento de Eventos",
         "Cadastros Base",
         "Fechamento Mensal",
+        "⚙️ Parâmetros AJAGRO",
         "⚙️ Ajuste de Preços"
     ])
 
@@ -189,7 +212,6 @@ else:
                 with col_s1:
                     st.metric("Saldo Atual", fmt_cab(saldo_atual))
 
-                    # Simula o saldo após o lançamento atual (preview)
                     if evento_sel in EVENTOS_SAIDA or evento_sel == "Transferências/Para Outras Categorias":
                         saldo_depois = saldo_atual - qtd
                         delta_txt    = f"−{fmt_br(qtd)} cab."
@@ -293,11 +315,9 @@ else:
                                     })
                                     conn.commit()
 
-                                    # Limpa escolha de destino
                                     if "cat_destino_escolhido" in st.session_state:
                                         del st.session_state["cat_destino_escolhido"]
 
-                                    # --- HISTÓRICO VISUAL ANTES/DEPOIS ---
                                     saldo_origem_depois  = get_saldo_atual(conn, id_f, cat_sel)
                                     saldo_destino_depois = get_saldo_atual(conn, id_f, cat_destino_sel)
 
@@ -348,8 +368,8 @@ else:
         d_fim = st.sidebar.date_input("Data Final", hoje)
 
         st.info(
-            f"ℹ️ **Saldo acumulado histórico até {d_fim.strftime('%d/%m/%Y')}** "
-            f"(todo o histórico desde o início). "
+            f"ℹ️ **Saldo de estoque total atualizado até {d_fim.strftime('%d/%m/%Y')}** "
+            f"(todo o histórico desde o início dos lançamentos). "
             f"Para ver movimentações por período, use o **📋 Módulo de Auditoria**."
         )
 
@@ -385,7 +405,6 @@ else:
                 st.plotly_chart(fig, use_container_width=True)
             with col_t:
                 st.subheader("Tabela de Participação")
-                # Aplica formatação BR nas colunas numéricas
                 df_bal_fmt = df_bal.copy()
                 df_bal_fmt['Estoque']     = df_bal_fmt['Estoque'].apply(lambda v: fmt_br(v))
                 df_bal_fmt['Preço Unit.'] = df_bal_fmt['Preço Unit.'].apply(fmt_brl)
@@ -417,7 +436,6 @@ else:
                        quantidade as "Quantidade"
                 FROM lanc_estoque ORDER BY id_lancamento DESC LIMIT 20
             """), conn)
-            # Formata quantidade
             df_hist["Quantidade"] = df_hist["Quantidade"].apply(lambda v: fmt_br(v))
             st.table(df_hist)
         else:
@@ -510,7 +528,7 @@ else:
 
         st.divider()
 
-        # Tabela por categoria — formatação BR
+        # Tabela por categoria
         st.subheader("📊 Saldo por Categoria")
         df_display = df_cons.rename(columns={
             'categoria':     'Categoria',
@@ -524,11 +542,6 @@ else:
             if isinstance(val, (int, float)) and val < 0:
                 return 'color: red; font-weight: bold'
             return ''
-
-        # Cria cópia formatada para exibição
-        df_display_fmt = df_display.copy()
-        for col in ['Saldo Inicial', 'Entradas', 'Saídas', 'Saldo Final']:
-            df_display_fmt[col] = df_display_fmt[col].apply(lambda v: fmt_br(v))
 
         st.dataframe(
             df_display.style
@@ -585,7 +598,6 @@ else:
         df_extrato = pd.read_sql(q_extrato, conn, params=params_base)
 
         if not df_extrato.empty:
-            # Formata colunas numéricas no extrato
             df_extrato_fmt = df_extrato.copy()
             for col in ["Qtd", "Entrada (+)", "Saída (-)"]:
                 df_extrato_fmt[col] = df_extrato_fmt[col].apply(lambda v: fmt_br(v))
@@ -735,27 +747,34 @@ else:
             else:
                 return "🔴", "#e74c3c", "CRÍTICO"
 
+        # Carrega parâmetros do banco (ou fallback)
+        _p = get_parametros()
+
         grupos_mortalidade = {
             "Bezerros (0–60 dias)": {
                 "categorias": ["Mamando - Machos", "Mamando - Fêmeas"],
-                "verde_max": 3.0, "amarelo_max": 5.0,
-                "descricao": "Sobrevivência na fase mais crítica da vida."
+                "verde_max":   _p["mort_bezerros"]["verde_max"],
+                "amarelo_max": _p["mort_bezerros"]["amarelo_max"],
+                "descricao":   _p["mort_bezerros"]["descricao"],
             },
             "Recria (2–12 meses)": {
                 "categorias": ["Novilhas até 1 ano"],
-                "verde_max": 3.0, "amarelo_max": 5.0,
-                "descricao": "Saúde dos animais em desenvolvimento."
+                "verde_max":   _p["mort_recria"]["verde_max"],
+                "amarelo_max": _p["mort_recria"]["amarelo_max"],
+                "descricao":   _p["mort_recria"]["descricao"],
             },
             "Novilhas (>12 meses)": {
                 "categorias": ["Novilhas de 1 a 2 anos", "Novilhas Prenhas"],
-                "verde_max": 1.0, "amarelo_max": 2.0,
-                "descricao": "Fêmeas jovens aptas à reprodução."
+                "verde_max":   _p["mort_novilhas"]["verde_max"],
+                "amarelo_max": _p["mort_novilhas"]["amarelo_max"],
+                "descricao":   _p["mort_novilhas"]["descricao"],
             },
             "Vacas Adultas": {
                 "categorias": ["Vacas Lactantes", "Vacas Secas",
                                "Vacas a refugar", "Vacas refugadas"],
-                "verde_max": 3.0, "amarelo_max": 5.0,
-                "descricao": "Perda do ativo principal gerador de receita."
+                "verde_max":   _p["mort_vacas"]["verde_max"],
+                "amarelo_max": _p["mort_vacas"]["amarelo_max"],
+                "descricao":   _p["mort_vacas"]["descricao"],
             },
         }
 
@@ -807,8 +826,7 @@ else:
             WHERE data_movimento <= :d_fim {filtro_faz}
             GROUP BY categoria
         """)
-        df_saldo   = pd.read_sql(q_saldo, conn, params={"d_fim": d_fim, **({
-            "id_faz": params["id_faz"]} if "id_faz" in params else {})})
+        df_saldo   = pd.read_sql(q_saldo, conn, params={"d_fim": d_fim, **({"id_faz": params["id_faz"]} if "id_faz" in params else {})})
         saldo_dict = dict(zip(df_saldo['categoria'], df_saldo['saldo'].clip(lower=0)))
 
         lactantes     = saldo_dict.get("Vacas Lactantes", 0)
@@ -827,18 +845,33 @@ else:
             else:
                 return "🔴", "#e74c3c", "CRÍTICO"
 
-        em1, cor1, lb1 = semaforo_comp(pct_lact_vacas,   83.0, 75.0)
-        em2, cor2, lb2 = semaforo_comp(pct_lact_rebanho, 55.0, 50.0)
+        # Limiares agora vêm do banco via get_parametros()
+        em1, cor1, lb1 = semaforo_comp(
+            pct_lact_vacas,
+            _p["comp_lact_vacas"]["verde_max"],
+            _p["comp_lact_vacas"]["amarelo_max"]
+        )
+        em2, cor2, lb2 = semaforo_comp(
+            pct_lact_rebanho,
+            _p["comp_lact_rebanho"]["verde_max"],
+            _p["comp_lact_rebanho"]["amarelo_max"]
+        )
+
+        # Metas dinâmicas para exibição nos cards
+        meta_lv_v = f"≥ {fmt_br(_p['comp_lact_vacas']['verde_max'], 1)}%"
+        meta_lv_a = f"{fmt_br(_p['comp_lact_vacas']['amarelo_max'], 1)}% a {fmt_br(_p['comp_lact_vacas']['verde_max'] - 1, 1)}%"
+        meta_lr_v = f"≥ {fmt_br(_p['comp_lact_rebanho']['verde_max'], 1)}%"
+        meta_lr_a = f"{fmt_br(_p['comp_lact_rebanho']['amarelo_max'], 1)}% a {fmt_br(_p['comp_lact_rebanho']['verde_max'] - 1, 1)}%"
 
         c1, c2 = st.columns(2)
         for col, emoji, cor, label, titulo, valor, meta_v, meta_a, descricao in [
             (c1, em1, cor1, lb1,
              "% Lactantes / Total de Vacas", pct_lact_vacas,
-             "≥ 83%", "75% a 82%",
+             meta_lv_v, meta_lv_a,
              f"Lactantes: {fmt_br(lactantes)} | Secas: {fmt_br(secas)} | Total Vacas: {fmt_br(total_vacas)}"),
             (c2, em2, cor2, lb2,
              "% Lactantes / Rebanho Total", pct_lact_rebanho,
-             "≥ 55%", "50% a 54%",
+             meta_lr_v, meta_lr_a,
              f"Lactantes: {fmt_br(lactantes)} | Rebanho Total: {fmt_br(total_rebanho)} animais"),
         ]:
             with col:
@@ -879,8 +912,8 @@ else:
             "População":      fmt_br(total_vacas),
             "Taxa (%)":       fmt_br(pct_lact_vacas, 2),
             "Status":         f"{em1} {lb1}",
-            "Meta Verde":     "≥ 83%",
-            "Limite Crítico": "< 75%",
+            "Meta Verde":     meta_lv_v,
+            "Limite Crítico": f"< {fmt_br(_p['comp_lact_vacas']['amarelo_max'], 1)}%",
         })
         rows.append({
             "Indicador":      "% Lactantes / Rebanho Total",
@@ -888,8 +921,8 @@ else:
             "População":      fmt_br(total_rebanho),
             "Taxa (%)":       fmt_br(pct_lact_rebanho, 2),
             "Status":         f"{em2} {lb2}",
-            "Meta Verde":     "≥ 55%",
-            "Limite Crítico": "< 50%",
+            "Meta Verde":     meta_lr_v,
+            "Limite Crítico": f"< {fmt_br(_p['comp_lact_rebanho']['amarelo_max'], 1)}%",
         })
         df_resumo = pd.DataFrame(rows)
         st.dataframe(df_resumo, use_container_width=True, hide_index=True)
@@ -910,13 +943,135 @@ else:
         mes = st.date_input("Mês para Fechar", date.today().replace(day=1))
         if st.button("Executar Fechamento"):
             conn = get_connection()
+            mes_normalizado = mes.replace(day=1)
             conn.execute(text("""
                 INSERT INTO fechamentos_mensais (ano_mes, status) VALUES (:m, 'Fechado')
                 ON CONFLICT (ano_mes) DO UPDATE SET status = 'Fechado'
-            """), {"m": mes})
+            """), {"m": mes_normalizado})
             conn.commit()
             conn.close()
-            st.success(f"Mês {mes.strftime('%m/%Y')} fechado!")
+            st.success(f"Mês {mes_normalizado.strftime('%m/%Y')} fechado!")
+
+    # =========================================================
+    # TELA: PARÂMETROS AJAGRO (novo v3.3)
+    # =========================================================
+    elif menu == "⚙️ Parâmetros AJAGRO":
+        st.header("⚙️ Parâmetros AJAGRO — Metas dos KPIs Zootécnicos")
+        st.caption("Ajuste os limiares de semáforo sem precisar alterar o código. As mudanças entram em vigor no próximo carregamento dos KPIs (cache de 5 min ou imediatamente ao salvar).")
+
+        params_atuais = get_parametros()
+        conn = get_connection()
+
+        st.subheader("🐄 Taxas de Mortalidade")
+        st.markdown("Para cada grupo, defina a taxa (%) que separa os status **Verde / Amarelo / Vermelho**.")
+
+        GRUPOS_LABELS = {
+            "mort_bezerros":  "Bezerros (0–60 dias)",
+            "mort_recria":    "Recria (2–12 meses)",
+            "mort_novilhas":  "Novilhas (>12 meses)",
+            "mort_vacas":     "Vacas Adultas",
+        }
+
+        with st.form("form_mort"):
+            novos_mort = {}
+            for chave, label in GRUPOS_LABELS.items():
+                atual = params_atuais.get(chave, {"verde_max": 3.0, "amarelo_max": 5.0, "descricao": ""})
+                st.markdown(f"**{label}**")
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1:
+                    desc = st.text_input("Descrição", value=atual["descricao"], key=f"desc_{chave}")
+                with c2:
+                    verde = st.number_input(
+                        "🟢 Meta verde (< %)", min_value=0.0, max_value=100.0,
+                        value=float(atual["verde_max"]), step=0.5, format="%.1f",
+                        key=f"verde_{chave}"
+                    )
+                with c3:
+                    amarelo = st.number_input(
+                        "🟡 Limite amarelo (< %)", min_value=0.0, max_value=100.0,
+                        value=float(atual["amarelo_max"]), step=0.5, format="%.1f",
+                        key=f"amarelo_{chave}"
+                    )
+                if verde >= amarelo:
+                    st.error(f"⚠️ Meta verde ({verde}%) deve ser menor que o limite amarelo ({amarelo}%).")
+                novos_mort[chave] = {"verde_max": verde, "amarelo_max": amarelo, "descricao": desc}
+                st.divider()
+
+            if st.form_submit_button("💾 Salvar Mortalidade", type="primary"):
+                erro = any(v["verde_max"] >= v["amarelo_max"] for v in novos_mort.values())
+                if erro:
+                    st.error("Corrija os valores antes de salvar: meta verde deve ser menor que limite amarelo.")
+                else:
+                    for chave, vals in novos_mort.items():
+                        conn.execute(text("""
+                            INSERT INTO parametros_ajagro (chave, verde_max, amarelo_max, descricao)
+                            VALUES (:chave, :v, :a, :d)
+                            ON CONFLICT (chave) DO UPDATE
+                                SET verde_max   = EXCLUDED.verde_max,
+                                    amarelo_max = EXCLUDED.amarelo_max,
+                                    descricao   = EXCLUDED.descricao
+                        """), {"chave": chave, "v": vals["verde_max"],
+                               "a": vals["amarelo_max"], "d": vals["descricao"]})
+                    conn.commit()
+                    get_parametros.clear()
+                    st.success("✅ Parâmetros de mortalidade atualizados!")
+                    st.rerun()
+
+        st.divider()
+        st.subheader("🐄 Composição do Rebanho")
+        st.markdown("Para estes indicadores, **verde** é o valor mínimo para status verde (quanto maior, melhor).")
+
+        COMP_LABELS = {
+            "comp_lact_vacas":   "% Lactantes / Total de Vacas",
+            "comp_lact_rebanho": "% Lactantes / Rebanho Total",
+        }
+
+        with st.form("form_comp"):
+            novos_comp = {}
+            for chave, label in COMP_LABELS.items():
+                atual = params_atuais.get(chave, {"verde_max": 83.0, "amarelo_max": 75.0, "descricao": ""})
+                st.markdown(f"**{label}**")
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1:
+                    desc = st.text_input("Descrição", value=atual["descricao"], key=f"desc_{chave}")
+                with c2:
+                    verde = st.number_input(
+                        "🟢 Meta verde (≥ %)", min_value=0.0, max_value=100.0,
+                        value=float(atual["verde_max"]), step=0.5, format="%.1f",
+                        key=f"verde_{chave}"
+                    )
+                with c3:
+                    amarelo = st.number_input(
+                        "🟡 Limite amarelo (≥ %)", min_value=0.0, max_value=100.0,
+                        value=float(atual["amarelo_max"]), step=0.5, format="%.1f",
+                        key=f"amarelo_{chave}"
+                    )
+                if amarelo >= verde:
+                    st.error(f"⚠️ Limite amarelo ({amarelo}%) deve ser menor que meta verde ({verde}%).")
+                novos_comp[chave] = {"verde_max": verde, "amarelo_max": amarelo, "descricao": desc}
+                st.divider()
+
+            if st.form_submit_button("💾 Salvar Composição", type="primary"):
+                erro = any(v["amarelo_max"] >= v["verde_max"] for v in novos_comp.values())
+                if erro:
+                    st.error("Corrija os valores antes de salvar.")
+                else:
+                    for chave, vals in novos_comp.items():
+                        conn.execute(text("""
+                            INSERT INTO parametros_ajagro (chave, verde_max, amarelo_max, descricao)
+                            VALUES (:chave, :v, :a, :d)
+                            ON CONFLICT (chave) DO UPDATE
+                                SET verde_max   = EXCLUDED.verde_max,
+                                    amarelo_max = EXCLUDED.amarelo_max,
+                                    descricao   = EXCLUDED.descricao
+                        """), {"chave": chave, "v": vals["verde_max"],
+                               "a": vals["amarelo_max"], "d": vals["descricao"]})
+                    conn.commit()
+                    get_parametros.clear()
+                    st.success("✅ Parâmetros de composição atualizados!")
+                    st.rerun()
+
+        conn.close()
 
     # =========================================================
     # TELA: AJUSTE DE PREÇOS
