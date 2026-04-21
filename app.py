@@ -163,6 +163,7 @@ else:
         "Dashboard & Balanço",
         "📋 Módulo de Auditoria",
         "📊 KPIs Zootécnicos",
+        "📄 Módulo de Relatórios",
         "Lançamento de Eventos",
         "Cadastros Base",
         "Fechamento Mensal",
@@ -368,8 +369,8 @@ else:
         d_fim = st.sidebar.date_input("Data Final", hoje)
 
         st.info(
-            f"ℹ️ **Saldo de estoque total atualizado até {d_fim.strftime('%d/%m/%Y')}** "
-            f"(todo o histórico desde o início dos lançamentos). "
+            f"ℹ️ **Saldo acumulado histórico até {d_fim.strftime('%d/%m/%Y')}** "
+            f"(todo o histórico desde o início). "
             f"Para ver movimentações por período, use o **📋 Módulo de Auditoria**."
         )
 
@@ -669,6 +670,439 @@ else:
                                    mime="application/pdf")
         else:
             st.info("Nenhum lançamento encontrado neste período para os filtros selecionados.")
+
+        conn.close()
+
+    # =========================================================
+    # TELA: MÓDULO DE RELATÓRIOS
+    # =========================================================
+    elif menu == "📄 Módulo de Relatórios":
+        st.header("📄 Relatório Gerencial Consolidado")
+        st.caption("Consolida Balanço, Movimentações, KPIs Zootécnicos e Fechamentos em um único relatório exportável.")
+
+        conn     = get_connection()
+        fazendas = pd.read_sql(text("SELECT id_fazenda, nome_fazenda FROM fazendas"), conn)
+
+        st.sidebar.divider()
+        st.sidebar.subheader("Filtros do Relatório")
+        hoje  = date.today()
+        d_ini = st.sidebar.date_input("Data Inicial", date(hoje.year, hoje.month, 1), key="rel_ini")
+        d_fim = st.sidebar.date_input("Data Final",   hoje,                           key="rel_fim")
+
+        faz_opcoes = ["Todas as Fazendas"] + fazendas['nome_fazenda'].tolist()
+        faz_sel    = st.sidebar.selectbox("Fazenda", faz_opcoes, key="rel_faz")
+
+        cat_opcoes = ["Todas as Categorias"] + CATEGORIAS_LISTA
+        cat_sel    = st.sidebar.selectbox("Categoria", cat_opcoes, key="rel_cat")
+
+        evt_opcoes = ["Todos os Eventos"] + EVENTOS_ENTRADA + EVENTOS_SAIDA
+        evt_sel    = st.sidebar.selectbox("Tipo de Evento", evt_opcoes, key="rel_evt")
+
+        filtro_faz_sql     = ""
+        filtro_faz_sql_bare = ""
+        filtro_cat_sql     = ""
+        filtro_cat_sql_bare = ""
+        filtro_evt_sql     = ""
+        params_base        = {"d_ini": d_ini, "d_fim": d_fim, "d_fim_bal": d_fim}
+
+        if faz_sel != "Todas as Fazendas":
+            id_faz = int(fazendas[fazendas['nome_fazenda'] == faz_sel]['id_fazenda'].values[0])
+            filtro_faz_sql        = "AND l.id_fazenda = :id_faz"
+            filtro_faz_sql_bare   = "AND id_fazenda = :id_faz"
+            params_base["id_faz"] = id_faz
+
+        if cat_sel != "Todas as Categorias":
+            filtro_cat_sql        = "AND l.categoria = :cat"
+            filtro_cat_sql_bare   = "AND categoria = :cat"
+            params_base["cat"]    = cat_sel
+
+        if evt_sel != "Todos os Eventos":
+            filtro_evt_sql      = "AND l.evento = :evt"
+            params_base["evt"]  = evt_sel
+
+        st.info(
+            f"📅 **Período:** {d_ini.strftime('%d/%m/%Y')} → {d_fim.strftime('%d/%m/%Y')}  |  "
+            f"🏠 **Fazenda:** {faz_sel}  |  "
+            f"🐄 **Categoria:** {cat_sel}  |  "
+            f"📋 **Evento:** {evt_sel}"
+        )
+
+        # --- SEÇÃO 1: BALANÇO PATRIMONIAL ---
+        st.subheader("1. Balanço Patrimonial")
+        st.caption(f"Estoque acumulado até {d_fim.strftime('%d/%m/%Y')}")
+
+        q_bal = text(f"""
+            SELECT categoria as "Categoria",
+                   SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
+                            THEN quantidade ELSE -quantidade END) as "Estoque"
+            FROM lanc_estoque
+            WHERE data_movimento <= :d_fim_bal
+            {filtro_faz_sql_bare} {filtro_cat_sql_bare}
+            GROUP BY categoria
+        """)
+        df_bal = pd.read_sql(q_bal, conn, params=params_base)
+        df_p   = pd.read_sql(text("SELECT * FROM precos_gestao"), conn)
+        dict_p = dict(zip(df_p['categoria'], df_p['valor']))
+
+        if not df_bal.empty:
+            df_bal['Preço Unit.'] = df_bal['Categoria'].map(dict_p).fillna(0)
+            df_bal['Total R$']    = df_bal['Estoque'] * df_bal['Preço Unit.']
+            df_bal = df_bal[df_bal['Estoque'] > 0].copy()
+            total_cab = df_bal['Estoque'].sum()
+            total_val = df_bal['Total R$'].sum()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Estoque Total",     fmt_cab(total_cab))
+            m2.metric("Valorização Total", fmt_brl(total_val))
+            m3.metric("Média por Animal",  fmt_brl(total_val / total_cab if total_cab > 0 else 0))
+            df_bal_fmt = df_bal.copy()
+            df_bal_fmt['Estoque']     = df_bal_fmt['Estoque'].apply(fmt_br)
+            df_bal_fmt['Preço Unit.'] = df_bal_fmt['Preço Unit.'].apply(fmt_brl)
+            df_bal_fmt['Total R$']    = df_bal_fmt['Total R$'].apply(fmt_brl)
+            st.dataframe(df_bal_fmt, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem dados de balanço para os filtros selecionados.")
+            df_bal    = pd.DataFrame()
+            total_cab = 0
+            total_val = 0.0
+
+        # --- SEÇÃO 2: MOVIMENTAÇÕES DO PERÍODO ---
+        st.divider()
+        st.subheader("2. Movimentações do Período")
+
+        q_mov_det = text(f"""
+            SELECT
+                TO_CHAR(l.data_movimento, 'DD/MM/YYYY') as "Data",
+                f.nome_fazenda                          as "Fazenda",
+                l.categoria                             as "Categoria",
+                l.evento                                as "Evento",
+                CASE WHEN l.evento LIKE 'Entrada%%' OR l.evento LIKE 'Transferências/De%%'
+                     THEN l.quantidade ELSE 0 END       as "Entrada (+)",
+                CASE WHEN l.evento LIKE 'Saída%%' OR l.evento LIKE 'Transferências/Para%%'
+                     THEN l.quantidade ELSE 0 END       as "Saída (-)",
+                l.observacao                            as "Observação"
+            FROM lanc_estoque l
+            JOIN fazendas f ON f.id_fazenda = l.id_fazenda
+            WHERE l.data_movimento BETWEEN :d_ini AND :d_fim
+            {filtro_faz_sql} {filtro_cat_sql} {filtro_evt_sql}
+            ORDER BY l.data_movimento ASC, l.id_lancamento ASC
+        """)
+        df_mov = pd.read_sql(q_mov_det, conn, params=params_base)
+
+        q_saldo_cat = text(f"""
+            SELECT categoria as "Categoria",
+                   SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
+                            THEN quantidade ELSE -quantidade END) as saldo_ini,
+                   SUM(CASE WHEN (evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%')
+                                 AND data_movimento BETWEEN :d_ini AND :d_fim
+                            THEN quantidade ELSE 0 END) as entradas,
+                   SUM(CASE WHEN (evento LIKE 'Saída%%' OR evento LIKE 'Transferências/Para%%')
+                                 AND data_movimento BETWEEN :d_ini AND :d_fim
+                            THEN quantidade ELSE 0 END) as saidas
+            FROM lanc_estoque
+            WHERE 1=1 {filtro_faz_sql_bare} {filtro_cat_sql_bare}
+            GROUP BY categoria
+        """)
+        df_saldo_cat = pd.read_sql(q_saldo_cat, conn, params=params_base)
+
+        if not df_saldo_cat.empty:
+            df_saldo_cat['Saldo Inicial'] = df_saldo_cat['saldo_ini'] - df_saldo_cat['entradas'] + df_saldo_cat['saidas']
+            df_saldo_cat['Saldo Final']   = df_saldo_cat['Saldo Inicial'] + df_saldo_cat['entradas'] - df_saldo_cat['saidas']
+            df_saldo_cat = df_saldo_cat.rename(columns={'entradas': 'Entradas', 'saidas': 'Saídas'})[
+                ['Categoria', 'Saldo Inicial', 'Entradas', 'Saídas', 'Saldo Final']
+            ]
+            df_saldo_cat = df_saldo_cat[
+                (df_saldo_cat['Saldo Inicial'] != 0) |
+                (df_saldo_cat['Entradas'] != 0) |
+                (df_saldo_cat['Saídas'] != 0)
+            ]
+            total_ent = int(df_saldo_cat['Entradas'].sum())
+            total_sai = int(df_saldo_cat['Saídas'].sum())
+            m1, m2 = st.columns(2)
+            m1.metric("Total Entradas", f"+ {fmt_br(total_ent)} cab.")
+            m2.metric("Total Saídas",   f"- {fmt_br(total_sai)} cab.")
+            df_sc_fmt = df_saldo_cat.copy()
+            for col in ['Saldo Inicial', 'Entradas', 'Saídas', 'Saldo Final']:
+                df_sc_fmt[col] = df_sc_fmt[col].apply(fmt_br)
+            st.dataframe(df_sc_fmt, use_container_width=True, hide_index=True)
+        else:
+            df_saldo_cat = pd.DataFrame()
+            total_ent    = 0
+            total_sai    = 0
+
+        if not df_mov.empty:
+            with st.expander("📑 Extrato linha a linha", expanded=False):
+                df_mov_fmt = df_mov.copy()
+                df_mov_fmt['Entrada (+)'] = df_mov_fmt['Entrada (+)'].apply(fmt_br)
+                df_mov_fmt['Saída (-)']   = df_mov_fmt['Saída (-)'].apply(fmt_br)
+                st.dataframe(df_mov_fmt, use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhuma movimentação encontrada para os filtros selecionados.")
+
+        # --- SEÇÃO 3: KPIs ZOOTÉCNICOS ---
+        st.divider()
+        st.subheader("3. KPIs Zootécnicos")
+
+        _p = get_parametros()
+
+        def _calc_kpi_rel(conn, categorias, params, filtro_faz_bare):
+            cats_sql  = ", ".join([f"'{c}'" for c in categorias])
+            obitos    = conn.execute(text(f"""
+                SELECT COALESCE(SUM(quantidade), 0) FROM lanc_estoque
+                WHERE evento = 'Saída/Mortes' AND categoria IN ({cats_sql})
+                  AND data_movimento BETWEEN :d_ini AND :d_fim {filtro_faz_bare}
+            """), params).scalar() or 0
+            saldo_ini = conn.execute(text(f"""
+                SELECT COALESCE(SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
+                     THEN quantidade ELSE -quantidade END), 0)
+                FROM lanc_estoque
+                WHERE categoria IN ({cats_sql}) AND data_movimento < :d_ini {filtro_faz_bare}
+            """), params).scalar() or 0
+            entradas  = conn.execute(text(f"""
+                SELECT COALESCE(SUM(quantidade), 0) FROM lanc_estoque
+                WHERE (evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%')
+                  AND categoria IN ({cats_sql})
+                  AND data_movimento BETWEEN :d_ini AND :d_fim {filtro_faz_bare}
+            """), params).scalar() or 0
+            pop  = saldo_ini + entradas
+            taxa = round((obitos / pop * 100) if pop > 0 else 0.0, 2)
+            return int(obitos), int(pop), taxa
+
+        grupos_kpi_rel = {
+            "Bezerros (0–60 dias)":  {"categorias": ["Mamando - Machos", "Mamando - Fêmeas"],
+                                       "verde_max": _p["mort_bezerros"]["verde_max"], "amarelo_max": _p["mort_bezerros"]["amarelo_max"]},
+            "Recria (2–12 meses)":   {"categorias": ["Novilhas até 1 ano"],
+                                       "verde_max": _p["mort_recria"]["verde_max"],   "amarelo_max": _p["mort_recria"]["amarelo_max"]},
+            "Novilhas (>12 meses)":  {"categorias": ["Novilhas de 1 a 2 anos", "Novilhas Prenhas"],
+                                       "verde_max": _p["mort_novilhas"]["verde_max"], "amarelo_max": _p["mort_novilhas"]["amarelo_max"]},
+            "Vacas Adultas":         {"categorias": ["Vacas Lactantes", "Vacas Secas", "Vacas a refugar", "Vacas refugadas"],
+                                       "verde_max": _p["mort_vacas"]["verde_max"],    "amarelo_max": _p["mort_vacas"]["amarelo_max"]},
+        }
+
+        rows_kpi = []
+        for nome, cfg in grupos_kpi_rel.items():
+            ob, pop, taxa = _calc_kpi_rel(conn, cfg["categorias"], params_base, filtro_faz_sql_bare)
+            if taxa < cfg["verde_max"]:       status = "🟢 IDEAL"
+            elif taxa <= cfg["amarelo_max"]:  status = "🟡 ATENÇÃO"
+            else:                             status = "🔴 CRÍTICO"
+            rows_kpi.append({"Grupo": nome, "Óbitos": fmt_br(ob), "População": fmt_br(pop),
+                              "Taxa (%)": fmt_br(taxa, 2), "Status": status,
+                              "Meta Verde": f"< {fmt_br(cfg['verde_max'], 1)}%",
+                              "Limite Crítico": f"> {fmt_br(cfg['amarelo_max'], 1)}%"})
+
+        q_comp = text(f"""
+            SELECT categoria, SUM(CASE WHEN evento LIKE 'Entrada%%' OR evento LIKE 'Transferências/De%%'
+                            THEN quantidade ELSE -quantidade END) as saldo
+            FROM lanc_estoque WHERE data_movimento <= :d_fim_bal {filtro_faz_sql_bare}
+            GROUP BY categoria
+        """)
+        df_comp    = pd.read_sql(q_comp, conn, params=params_base)
+        saldo_dict = dict(zip(df_comp['categoria'], df_comp['saldo'].clip(lower=0))) if not df_comp.empty else {}
+        lactantes     = saldo_dict.get("Vacas Lactantes", 0)
+        secas         = saldo_dict.get("Vacas Secas", 0)
+        total_rebanho = sum(v for v in saldo_dict.values() if v > 0)
+        total_vacas   = lactantes + secas
+        pct_lv = (lactantes / total_vacas   * 100) if total_vacas   > 0 else 0.0
+        pct_lr = (lactantes / total_rebanho * 100) if total_rebanho > 0 else 0.0
+
+        def _sem_comp(v, vmin, amin):
+            if v >= vmin:   return "🟢 IDEAL"
+            elif v >= amin: return "🟡 ATENÇÃO"
+            else:           return "🔴 CRÍTICO"
+
+        rows_kpi.append({"Grupo": "% Lactantes / Total Vacas",    "Óbitos": "—", "População": fmt_br(total_vacas),
+                          "Taxa (%)": fmt_br(pct_lv, 2), "Status": _sem_comp(pct_lv, _p["comp_lact_vacas"]["verde_max"],   _p["comp_lact_vacas"]["amarelo_max"]),
+                          "Meta Verde": f"≥ {fmt_br(_p['comp_lact_vacas']['verde_max'], 1)}%",   "Limite Crítico": f"< {fmt_br(_p['comp_lact_vacas']['amarelo_max'], 1)}%"})
+        rows_kpi.append({"Grupo": "% Lactantes / Rebanho Total",  "Óbitos": "—", "População": fmt_br(total_rebanho),
+                          "Taxa (%)": fmt_br(pct_lr, 2), "Status": _sem_comp(pct_lr, _p["comp_lact_rebanho"]["verde_max"], _p["comp_lact_rebanho"]["amarelo_max"]),
+                          "Meta Verde": f"≥ {fmt_br(_p['comp_lact_rebanho']['verde_max'], 1)}%", "Limite Crítico": f"< {fmt_br(_p['comp_lact_rebanho']['amarelo_max'], 1)}%"})
+
+        df_kpi = pd.DataFrame(rows_kpi)
+        st.dataframe(df_kpi, use_container_width=True, hide_index=True)
+
+        # --- SEÇÃO 4: FECHAMENTOS MENSAIS ---
+        st.divider()
+        st.subheader("4. Fechamentos Mensais no Período")
+        try:
+            df_fech = pd.read_sql(text("""
+                SELECT TO_CHAR(DATE(ano_mes AT TIME ZONE 'UTC'), 'MM/YYYY') as "Mês",
+                       status as "Status",
+                       TO_CHAR(updated_at, 'DD/MM/YYYY HH24:MI') as "Registrado em"
+                FROM fechamentos_mensais
+                WHERE DATE(ano_mes AT TIME ZONE 'UTC') BETWEEN :d_ini AND :d_fim
+                ORDER BY ano_mes ASC
+            """), conn, params={"d_ini": d_ini, "d_fim": d_fim})
+        except Exception:
+            df_fech = pd.DataFrame(columns=["Mês", "Status", "Registrado em"])
+
+        if not df_fech.empty:
+            n_fechados = (df_fech["Status"] == "Fechado").sum()
+            st.metric("Meses fechados no período", f"{n_fechados} / {len(df_fech)}")
+            st.dataframe(df_fech, use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum fechamento registrado neste período.")
+
+        # --- EXPORTAÇÕES ---
+        st.divider()
+        st.subheader("📥 Exportar Relatório")
+        col_pdf, col_xls = st.columns(2)
+
+        # EXCEL — 4 abas
+        with col_xls:
+            buf_xls = io.BytesIO()
+            with pd.ExcelWriter(buf_xls, engine='openpyxl') as writer:
+                if not df_bal.empty:
+                    df_bal_exp = df_bal.copy()
+                    df_bal_exp['Estoque']     = df_bal_exp['Estoque'].apply(fmt_br)
+                    df_bal_exp['Preço Unit.'] = df_bal_exp['Preço Unit.'].apply(fmt_brl)
+                    df_bal_exp['Total R$']    = df_bal_exp['Total R$'].apply(fmt_brl)
+                    df_bal_exp.to_excel(writer, sheet_name='1. Balanço Patrimonial', index=False)
+                else:
+                    pd.DataFrame([{"Info": "Sem dados"}]).to_excel(writer, sheet_name='1. Balanço Patrimonial', index=False)
+
+                if not df_saldo_cat.empty:
+                    df_saldo_cat.to_excel(writer, sheet_name='2. Movimentações', index=False, startrow=0)
+                if not df_mov.empty:
+                    start = len(df_saldo_cat) + 3 if not df_saldo_cat.empty else 0
+                    df_mov.to_excel(writer, sheet_name='2. Movimentações', index=False, startrow=start)
+
+                df_kpi.to_excel(writer, sheet_name='3. KPIs Zootécnicos', index=False)
+
+                if not df_fech.empty:
+                    df_fech.to_excel(writer, sheet_name='4. Fechamentos Mensais', index=False)
+                else:
+                    pd.DataFrame([{"Info": "Sem fechamentos no período"}]).to_excel(
+                        writer, sheet_name='4. Fechamentos Mensais', index=False)
+
+            st.download_button(
+                "📊 Baixar Excel (4 abas)",
+                buf_xls.getvalue(),
+                f"relatorio_ajagro_{d_ini.strftime('%Y%m%d')}_{d_fim.strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+        # PDF — ReportLab com capa + 4 seções
+        with col_pdf:
+            from reportlab.lib.styles import ParagraphStyle
+            from reportlab.lib.enums import TA_CENTER
+            from reportlab.lib.units import cm
+            from reportlab.platypus import HRFlowable
+
+            pdf_buf = io.BytesIO()
+            doc_pdf = SimpleDocTemplate(pdf_buf, pagesize=A4,
+                                        leftMargin=40, rightMargin=40,
+                                        topMargin=50, bottomMargin=40)
+
+            style_title   = ParagraphStyle('T2',  parent=styles['Title'],   fontSize=18, spaceAfter=6,  alignment=TA_CENTER)
+            style_sub_pdf = ParagraphStyle('Sub', parent=styles['Normal'],  fontSize=10, spaceAfter=12, alignment=TA_CENTER, textColor=colors.HexColor('#555555'))
+            style_h2_pdf  = ParagraphStyle('H2',  parent=styles['Heading2'],fontSize=12, spaceBefore=14,spaceAfter=6,  textColor=colors.HexColor('#2c3e50'))
+            style_cap_pdf = ParagraphStyle('Cap', parent=styles['Normal'],  fontSize=8,  spaceAfter=6,  textColor=colors.HexColor('#777777'))
+            style_nor_pdf = ParagraphStyle('Nor', parent=styles['Normal'],  fontSize=9,  spaceAfter=4)
+            styles_obj    = getSampleStyleSheet()
+
+            COL_HDR   = colors.HexColor('#2c3e50')
+            COL_ALT   = colors.HexColor('#f2f2f2')
+            COL_GREEN_PDF = colors.HexColor('#27ae60')
+
+            def make_pdf_table(data, col_widths=None, hdr_color=COL_HDR):
+                t = Table(data, colWidths=col_widths, hAlign='LEFT', repeatRows=1)
+                t.setStyle(TableStyle([
+                    ('BACKGROUND',    (0,0),(-1,0),  hdr_color),
+                    ('TEXTCOLOR',     (0,0),(-1,0),  colors.white),
+                    ('FONTNAME',      (0,0),(-1,0),  'Helvetica-Bold'),
+                    ('FONTSIZE',      (0,0),(-1,-1), 7.5),
+                    ('ROWBACKGROUNDS',(0,1),(-1,-1), [colors.white, COL_ALT]),
+                    ('GRID',          (0,0),(-1,-1), 0.4, colors.HexColor('#cccccc')),
+                    ('LEFTPADDING',   (0,0),(-1,-1), 5),
+                    ('RIGHTPADDING',  (0,0),(-1,-1), 5),
+                    ('TOPPADDING',    (0,0),(-1,-1), 3),
+                    ('BOTTOMPADDING', (0,0),(-1,-1), 3),
+                ]))
+                return t
+
+            elem = []
+
+            # Capa
+            elem.append(Spacer(1, 2*cm))
+            elem.append(Paragraph("AJAGRO", style_title))
+            elem.append(Paragraph("Relatório Gerencial Consolidado", style_title))
+            elem.append(Spacer(1, 0.4*cm))
+            elem.append(Paragraph(f"Período: {d_ini.strftime('%d/%m/%Y')} a {d_fim.strftime('%d/%m/%Y')}", style_sub_pdf))
+            elem.append(Paragraph(f"Fazenda: {faz_sel}  |  Categoria: {cat_sel}  |  Evento: {evt_sel}", style_sub_pdf))
+            elem.append(Paragraph(f"Gerado em: {date.today().strftime('%d/%m/%Y')}", style_sub_pdf))
+            elem.append(Spacer(1, 1*cm))
+            elem.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#2c3e50')))
+            elem.append(Spacer(1, 1*cm))
+
+            # Seção 1 — Balanço
+            elem.append(Paragraph("1. Balanço Patrimonial", style_h2_pdf))
+            elem.append(Paragraph(
+                f"Estoque até {d_fim.strftime('%d/%m/%Y')} | Total: {fmt_cab(total_cab)} | Valorização: {fmt_brl(total_val)}",
+                style_cap_pdf
+            ))
+            if not df_bal.empty:
+                data_b = [['Categoria', 'Estoque (cab.)', 'Preço Unit.', 'Total R$']]
+                for _, row in df_bal.iterrows():
+                    data_b.append([row['Categoria'], fmt_br(row['Estoque']), fmt_brl(row['Preço Unit.']), fmt_brl(row['Total R$'])])
+                data_b.append(['TOTAL', fmt_br(total_cab), '—', fmt_brl(total_val)])
+                tb = make_pdf_table(data_b, col_widths=[150, 80, 80, 85])
+                tb.setStyle(TableStyle([
+                    ('FONTNAME',   (0, len(data_b)-1), (-1, len(data_b)-1), 'Helvetica-Bold'),
+                    ('BACKGROUND', (0, len(data_b)-1), (-1, len(data_b)-1), colors.HexColor('#e8f4f8')),
+                ]))
+                elem.append(tb)
+            else:
+                elem.append(Paragraph("Sem dados para os filtros selecionados.", style_nor_pdf))
+            elem.append(Spacer(1, 0.6*cm))
+
+            # Seção 2 — Movimentações
+            elem.append(Paragraph("2. Movimentações do Período", style_h2_pdf))
+            elem.append(Paragraph(f"Entradas: +{fmt_br(total_ent)} cab. | Saídas: -{fmt_br(total_sai)} cab.", style_cap_pdf))
+            if not df_saldo_cat.empty:
+                data_ms = [['Categoria', 'Saldo Inicial', 'Entradas', 'Saídas', 'Saldo Final']]
+                for _, row in df_saldo_cat.iterrows():
+                    data_ms.append([row['Categoria'], fmt_br(row['Saldo Inicial']), fmt_br(row['Entradas']),
+                                    fmt_br(row['Saídas']), fmt_br(row['Saldo Final'])])
+                elem.append(make_pdf_table(data_ms, col_widths=[150, 70, 70, 70, 70], hdr_color=COL_GREEN_PDF))
+            if not df_mov.empty:
+                elem.append(Spacer(1, 0.3*cm))
+                elem.append(Paragraph("Extrato linha a linha:", style_cap_pdf))
+                data_ex = [['Data', 'Fazenda', 'Categoria', 'Evento', 'Ent.(+)', 'Saí.(-)']]
+                for _, row in df_mov.iterrows():
+                    data_ex.append([row['Data'], str(row['Fazenda'])[:18], str(row['Categoria'])[:20],
+                                    str(row['Evento'])[:28], fmt_br(row['Entrada (+)']), fmt_br(row['Saída (-)'])])
+                elem.append(make_pdf_table(data_ex, col_widths=[42, 62, 72, 90, 40, 40]))
+            elem.append(Spacer(1, 0.6*cm))
+
+            # Seção 3 — KPIs
+            elem.append(Paragraph("3. KPIs Zootécnicos", style_h2_pdf))
+            data_kpi_pdf = [['Indicador', 'Óbitos', 'Pop.', 'Taxa (%)', 'Status', 'Meta Verde']]
+            for _, row in df_kpi.iterrows():
+                data_kpi_pdf.append([row['Grupo'], row['Óbitos'], row['População'], row['Taxa (%)'],
+                                     row['Status'].replace('🟢','[V]').replace('🟡','[A]').replace('🔴','[C]'),
+                                     row['Meta Verde']])
+            elem.append(make_pdf_table(data_kpi_pdf, col_widths=[115, 40, 45, 48, 60, 62]))
+            elem.append(Paragraph("Status: [V] Ideal  [A] Atenção  [C] Crítico", style_cap_pdf))
+            elem.append(Spacer(1, 0.6*cm))
+
+            # Seção 4 — Fechamentos
+            elem.append(Paragraph("4. Fechamentos Mensais", style_h2_pdf))
+            if not df_fech.empty:
+                data_fech_pdf = [['Mês', 'Status', 'Registrado em']]
+                for _, row in df_fech.iterrows():
+                    data_fech_pdf.append([row['Mês'], row['Status'], row['Registrado em']])
+                elem.append(make_pdf_table(data_fech_pdf, col_widths=[100, 100, 150]))
+            else:
+                elem.append(Paragraph("Nenhum fechamento registrado neste período.", style_nor_pdf))
+
+            doc_pdf.build(elem)
+            st.download_button(
+                "📄 Baixar PDF",
+                pdf_buf.getvalue(),
+                f"relatorio_ajagro_{d_ini.strftime('%Y%m%d')}_{d_fim.strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
 
         conn.close()
 
@@ -1095,3 +1529,5 @@ else:
                 conn.commit()
                 st.success("Preços atualizados!")
         conn.close()
+
+        
